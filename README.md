@@ -86,3 +86,7 @@ npm run typecheck
 npm run build   # dist/ (ESM + .d.ts)
 npm run check:dist  # fails if the checked-in dist/ differs from a fresh build
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

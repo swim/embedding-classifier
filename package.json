@@ -1,7 +1,7 @@
 {
   "name": "@liquidau/embedding-classifier",
   "version": "0.2.0",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "description": "Calibrated multi-head classifiers on text embeddings: train a calibrated logistic head per label, pick thresholds from recall or precision targets, evaluate with confidence intervals, slices and a baseline, gate, ship a JSON artifact, and score and decide at runtime with a priority and suppression policy.",
   "keywords": [
     "embeddings",
@@ -30,7 +30,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",

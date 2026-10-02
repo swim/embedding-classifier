@@ -11,6 +11,14 @@
     "logistic-regression",
     "model-gating"
   ],
+  "homepage": "https://github.com/swim/embedding-classifier#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/swim/embedding-classifier.git"
+  },
+  "bugs": {
+    "url": "https://github.com/swim/embedding-classifier/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=20"

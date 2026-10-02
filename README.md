@@ -9,7 +9,7 @@ regression on the embedding, calibrated to the label's production prevalence. It
 from an explicit recall or precision policy, and it must pass release gates before an artifact may
 be enforced.
 
-Built on [`@liquidau/solvers`](../solvers), which is verified against scikit-learn.
+Built on [`@liquidau/solvers`](https://www.npmjs.com/package/@liquidau/solvers), which is verified against scikit-learn.
 
 ## Pipeline
 
@@ -76,8 +76,7 @@ between training and runtime), the baseline, the decision policy, and what happe
 
 ## Develop
 
-`@liquidau/solvers` is a private package on the npm registry, so you need to be logged in as a member
-of the `@liquidau` org (or have a read token in `.npmrc`) to install.
+`@liquidau/solvers` is public on npm, so no login or token is needed to install.
 
 ```bash
 npm install

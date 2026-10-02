@@ -1,0 +1,253 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+
+import { CachedEmbedder, hashEmbedding, truncateText } from '../src/embedder.ts';
+import {
+  assertRoundTrip,
+  evaluateHead,
+  gateHead,
+  pickThreshold,
+  publishPlan,
+  reportMarkdown,
+  trainHeads,
+  type ClassifierArtifact,
+  type HeadPolicy,
+  type Split,
+} from '../src/index.ts';
+
+/** A temporary directory removed when the test finishes. */
+function tempDir(t: { after: (fn: () => void) => void }): string {
+  const dir = mkdtempSync(join(tmpdir(), 'embedder-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+const recall: HeadPolicy = { kind: 'recall', targetRecall: 0.95, designRecall: 0.98, maxFalseAlarm: 0.05, minPositives: 150, minRecallLower: 0.9, minPositiveGroups: 30 };
+const precision: HeadPolicy = { kind: 'precision', targetPrecision: 0.8 };
+
+test('recall threshold never exceeds the false-alarm budget, even with an outlier positive', () => {
+  const neg = Array.from({ length: 20 }, (_, i) => 0.01 * (i + 1));
+  const pos = [0.9, 0.85, 0.8, 0.95, 0.001];
+  const t = pickThreshold(recall, [...pos, ...neg], [...pos.map(() => 1), ...neg.map(() => 0)]);
+  const falseAlarms = neg.filter((p) => p >= t).length;
+  assert.ok(falseAlarms <= Math.floor(0.05 * neg.length), `threshold ${t} lets ${falseAlarms} negatives fire`);
+  assert.ok(t > 0.19, 'the outlier positive must not drag the threshold down');
+});
+
+test('thresholds keep a margin above the gate', () => {
+  const p = [0.99, 0.95, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1];
+  const y = p.map(() => 1);
+  assert.equal(pickThreshold(recall, p, y), 0.1); // 98% of 11 positives -> all 11 -> lowest
+  assert.equal(pickThreshold(precision, p, y), 0.8, 'precision heads use the target precision');
+  assert.throws(() => pickThreshold({ ...recall, designRecall: 0.9 } as HeadPolicy, p, y), /designRecall/);
+});
+
+test('evaluation compares against a baseline and gates on what the classifier adds', () => {
+  const ev = evaluateHead({ p: [0.1, 0.95, 0.01], y: [1, 1, 0], w: [1, 1, 1], threshold: 0.9, baseline: [true, false, false], slices: { source: ['a', 'b', 'a'] } });
+  assert.deepEqual(ev.vs_baseline, { caught_by_both: 0, caught_by_baseline_only: 1, caught_by_classifier_only: 1, missed_by_both: 0 });
+  assert.equal(ev.recall, 0.5);
+  assert.equal(ev.combined_recall, 1);
+  assert.deepEqual(Object.keys(ev.slices), ['source=a', 'source=b']);
+  const { failures, warnings } = gateHead(recall, ev);
+  assert.ok(failures.some((g) => g.startsWith('only 2 test positives')));
+  assert.ok(failures.some((g) => g.startsWith('test recall 0.500')));
+  assert.ok(!failures.some((g) => g.includes('adds no value')));
+  assert.ok(warnings.some((w) => w.includes('only 2 distinct group(s)')));
+  const useless = evaluateHead({ p: [0.1, 0.1], y: [1, 1], w: [1, 1], threshold: 0.9, baseline: [true, true] });
+  assert.ok(gateHead(recall, useless).failures.some((g) => g.includes('adds no value')));
+  assert.ok(!gateHead({ ...recall, mustBeatBaseline: false } as HeadPolicy, useless).failures.some((g) => g.includes('adds no value')));
+});
+
+test('a precision head that never fires gets an explicit gate message citing the evaluated threshold', () => {
+  const ev = evaluateHead({ p: [0.1, 0.2], y: [1, 0], w: [1, 1], threshold: 0.93 });
+  assert.match(gateHead(precision, ev).failures[0], /never fires on the test set at threshold 0.93/);
+});
+
+test('thin support warns by default and fails with an explicit minimum', () => {
+  const ev = evaluateHead({ p: [0.9, 0.1, 0.1, 0.1], y: [1, 0, 0, 0], w: [1, 1, 1, 1], threshold: 0.8 });
+  assert.equal(ev.fired, 1);
+  assert.ok(gateHead(precision, ev).warnings.some((w) => w.includes('only 1 fired test examples')));
+  assert.ok(gateHead({ ...precision, minFired: 5 } as HeadPolicy, ev).failures.some((f) => f.includes('fires on only 1')));
+  const recallNoMin = { kind: 'recall', targetRecall: 0.5, designRecall: 0.5 } as HeadPolicy;
+  assert.ok(gateHead(recallNoMin, ev).warnings.some((w) => w.includes('only 1 test positives and no minPositives')));
+  assert.ok(!gateHead({ ...recallNoMin, minPositives: 1 } as HeadPolicy, ev).warnings.some((w) => w.includes('minPositives')));
+});
+
+test('evaluateHead rejects misaligned inputs', () => {
+  assert.throws(() => evaluateHead({ p: [0.9, 0.1], y: [1, 0], w: [1, 1], threshold: 0.5, baseline: [true] }), /baseline has 1 entries but p has 2/);
+  assert.throws(() => evaluateHead({ p: [0.9, 0.1], y: [1, 0], w: [1, 1], threshold: 0.5, slices: { s: ['a'] } }), /slices.s has 1/);
+});
+
+test('publishing: failing models can be shadow candidates but never promoted', () => {
+  assert.deepEqual(publishPlan({ gatesPassed: true, promote: true }), { role: 'promoted' });
+  assert.match((publishPlan({ gatesPassed: false, promote: true }) as { error: string }).error, /refusing to promote/);
+  assert.deepEqual(publishPlan({ gatesPassed: false, shadowCandidate: true }), { role: 'shadow-candidate' });
+  assert.match((publishPlan({ gatesPassed: true, shadowCandidate: true, blockedReason: 'fake' }) as { error: string }).error, /refusing to publish: fake/);
+  assert.match((publishPlan({ gatesPassed: true, promote: true, shadowCandidate: true }) as { error: string }).error, /choose one/);
+  assert.match((publishPlan({ gatesPassed: false }) as { error: string }).error, /gates failed/);
+  assert.deepEqual(publishPlan({ gatesPassed: false, allowFailingGates: true }), { role: null });
+  assert.deepEqual(publishPlan({ gatesPassed: true }), { role: null });
+});
+
+/** Two separable clusters in 8 dims with a little label noise - enough to exercise the whole pipeline. */
+function dataset(n: number, seed = 1) {
+  let s = seed;
+  const rand = () => ((s = (s * 1664525 + 1013904223) % 2 ** 32) / 2 ** 32);
+  const X: number[][] = [];
+  const y: (0 | 1)[] = [];
+  const split: Split[] = [];
+  for (let i = 0; i < n; i++) {
+    const label = rand() < 0.3 ? 1 : 0;
+    X.push(Array.from({ length: 8 }, (_, j) => (j < 2 ? (label ? 1.5 : -1.5) : 0) + rand() * 2 - 1));
+    y.push(rand() < 0.02 ? ((1 - label) as 0 | 1) : label);
+    split.push((['train', 'train', 'calibration', 'test'] as const)[i % 4]);
+  }
+  return { X, y, split };
+}
+
+test('trainHeads end to end: fits, gates, and the serialised artifact scores identically', () => {
+  const { X, y, split } = dataset(2400);
+  const lines: string[] = [];
+  const result = trainHeads({
+    X, split, C: 1, log: (l) => lines.push(l),
+    heads: [
+      { name: 'urgent', y, prevalence: 0.05, policy: { ...recall, targetRecall: 0.9, designRecall: 0.95, minPositiveGroups: undefined } as HeadPolicy },
+      { name: 'spam', y, prevalence: 0.05, policy: { kind: 'precision', targetPrecision: 0.5 } },
+    ],
+    slices: { third: X.map((_, i) => String(i % 3)) },
+  });
+  assert.equal(lines.length, 2);
+  const ev = result.evaluation.urgent!;
+  assert.ok(ev.recall >= 0.9, `recall ${ev.recall}`);
+  assert.ok(ev.false_alarm_rate < 0.1, `false alarms ${ev.false_alarm_rate}`);
+  assert.deepEqual(Object.keys(ev.slices), ['third=0', 'third=1', 'third=2']);
+  assert.deepEqual(result.failures, [], result.failures.join('; '));
+  assert.equal(result.heads.urgent!.review_floor, result.heads.urgent!.threshold * 0.5);
+
+  const artifact: ClassifierArtifact<'urgent' | 'spam'> = {
+    version: 'v1', created_at: '', embedding: { model_id: 'test', dimensions: 8, normalize: false },
+    heads: result.heads, evaluation: result.evaluation, gates: { passed: true, failures: [], warnings: [] },
+  };
+  assertRoundTrip(artifact, X, result.testProbabilities);
+  assert.throws(() => assertRoundTrip({ ...artifact, heads: { ...artifact.heads, urgent: { ...artifact.heads.urgent!, bias: 1 } } }, X, result.testProbabilities), /differs/);
+  const report = reportMarkdown(artifact, { title: 'Test model', baselineName: 'rules' });
+  assert.match(report, /^# Test model/);
+  assert.match(report, /## urgent/);
+});
+
+test('trainHeads refuses a split without both classes', () => {
+  const { X, split } = dataset(40);
+  assert.throws(() => trainHeads({ X, split, heads: [{ name: 'h', y: X.map(() => 0), prevalence: 0.1, policy: precision }] }), /both positive and negative/);
+});
+
+test('trainHeads rejects misaligned or invalid inputs before fitting', () => {
+  const { X, y, split } = dataset(400);
+  const head = { name: 'h', y, prevalence: 0.05, policy: precision };
+  assert.throws(() => trainHeads({ X, split, heads: [head], groups: ['g'] }), /groups has 1 entries but X has 400/);
+  assert.throws(() => trainHeads({ X, split, heads: [head], slices: { src: ['a', 'b'] } }), /slices.src has 2 entries/);
+  assert.throws(() => trainHeads({ X, split, heads: [{ ...head, baseline: [true] }] }), /h: baseline has 1 entries/);
+  assert.throws(() => trainHeads({ X, split: split.map((s, i) => (i === 7 ? ('validation' as Split) : s)), heads: [head] }), /split\[7\] is "validation"/);
+  assert.throws(() => trainHeads({ X, split, heads: [{ ...head, prevalence: 1.5 }] }), /h: prevalence must be strictly between 0 and 1/);
+  assert.throws(() => trainHeads({ X, split, heads: [head], background: { X: [], maxRate: { h: 0.01 } } }), /background.X must be non-empty/);
+});
+
+test('trainHeads with isotonic calibration round-trips and records the shipped threshold', () => {
+  const { X, y, split } = dataset(1200);
+  const result = trainHeads({ X, split, calibration: 'isotonic', heads: [{ name: 'h', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.8, designRecall: 0.9, minPositives: 30 } }] });
+  assert.equal(result.heads.h!.calibration.method, 'isotonic');
+  assert.equal(result.evaluation.h!.threshold, result.heads.h!.threshold);
+  const artifact: ClassifierArtifact<'h'> = { version: 'v', created_at: '', embedding: { model_id: 't', dimensions: 8, normalize: false }, heads: result.heads };
+  assertRoundTrip(artifact, X, result.testProbabilities);
+});
+
+test('a budget-raised precision threshold is what the gate reports', () => {
+  const { X, y, split } = dataset(800);
+  const r = trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: { kind: 'precision', targetPrecision: 0.3 } }], background: { X: X.filter((_, i) => y[i] === 1).slice(0, 100), maxRate: { h: 0 } } });
+  const t = r.heads.h!.threshold;
+  assert.ok(t > 0.3);
+  assert.ok(r.failures.some((f) => f.includes(`threshold ${t}`)), r.failures.join('; '));
+});
+
+test('the report tolerates a partial evaluation from storage', () => {
+  const artifact = { version: 'v', created_at: '', embedding: { model_id: 'm', dimensions: 1, normalize: true },
+    heads: { h: { weights: [1], bias: 0, calibration: { method: 'platt' as const, a: 1, c: 0 }, threshold: 0.5, review_floor: 0.25 } },
+    evaluation: { h: { n: 1 }, gone: { n: 2 } } };
+  const report = reportMarkdown(artifact);
+  assert.match(report, /## h/);
+  assert.match(report, /recall \(95% CI\) \| n\/a/);
+  assert.doesNotMatch(report, /## gone/);
+});
+
+test('hash embeddings are deterministic and normalised', () => {
+  const a = hashEmbedding('my kid will not sleep', 64);
+  assert.deepEqual(a, hashEmbedding('my kid will not sleep', 64));
+  assert.ok(Math.abs(Math.hypot(...a) - 1) < 1e-12);
+});
+
+test('cached embedder: embeds each distinct (truncated) text once and persists the cache', async (t) => {
+  const cachePath = join(tempDir(t), 'nested', 'cache.json');
+  const calls: string[] = [];
+  const embed = async (text: string) => {
+    calls.push(text);
+    return hashEmbedding(text, 4);
+  };
+  const first = new CachedEmbedder({ cachePath, embed, maxChars: 5, concurrency: 3, checkpointEvery: 1, log: () => {} });
+  const out = await first.embedMany(['hello world', 'hello there', 'other']);
+  assert.deepEqual(calls.sort(), ['hello', 'other'], 'truncated texts are the cache key and what is embedded');
+  assert.deepEqual(out[0], out[1]);
+  const second = new CachedEmbedder({ cachePath, embed, maxChars: 5, log: () => {} });
+  await second.embedMany(['hello again']);
+  assert.equal(calls.length, 2, 'served from the persisted cache');
+  const { readdirSync } = await import('node:fs');
+  const { dirname } = await import('node:path');
+  assert.deepEqual(readdirSync(dirname(cachePath)).filter((f) => f.endsWith('.tmp')), [], 'no temporary files left behind');
+});
+
+test('background budget: thresholds rise until the head fires on at most maxRate of ordinary traffic, before gating', async () => {
+  const { budgetThreshold } = await import('../src/index.ts');
+  const bg = Array.from({ length: 100 }, (_, i) => i / 100); // 0.00 .. 0.99
+  assert.equal(budgetThreshold(0.5, bg, 0.05) > 0.94, true, 'at most 5 of 100 may reach it');
+  assert.equal(budgetThreshold(0.5, bg, 0.05) <= 0.95, true);
+  assert.equal(budgetThreshold(0.99, bg, 0.05), 0.99, 'never lowered');
+
+  const { X, y, split } = dataset(2400);
+  const heads = (maxRate?: number) => trainHeads({
+    X, split, heads: [{ name: 'urgent', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.5, designRecall: 0.9, maxFalseAlarm: 0.2 } as HeadPolicy }],
+    background: maxRate === undefined ? undefined : { X: X.filter((_, i) => y[i] === 0).slice(0, 400), maxRate: { urgent: maxRate } },
+  });
+  const loose = heads(), tight = heads(0.001);
+  assert.ok(tight.heads.urgent!.threshold >= loose.heads.urgent!.threshold);
+  assert.ok(tight.evaluation.urgent!.background_rate! <= 0.001);
+  assert.ok(tight.evaluation.urgent!.recall <= loose.evaluation.urgent!.recall, 'test metrics reflect the shipped threshold');
+});
+
+test('cached embedder: batches for providers that embed many texts per call', async (t) => {
+  const cachePath = join(tempDir(t), 'cache.json');
+  const calls: number[] = [];
+  const embedder = new CachedEmbedder({ cachePath, batchSize: 3, log: () => {}, embedBatch: async (texts) => { calls.push(texts.length); return texts.map((t) => hashEmbedding(t, 4)); } });
+  const out = await embedder.embedMany(['a', 'b', 'c', 'd', 'e', 'a']);
+  assert.deepEqual(calls.sort(), [2, 3], 'five distinct texts in batches of at most 3');
+  assert.deepEqual(out[0], out[5]);
+  assert.notEqual(out[0], out[5], 'duplicates are separate copies');
+  out[0][0] = 99;
+  assert.notEqual((await embedder.embedMany(['a']))[0][0], 99, 'mutating a result does not touch the cache');
+  assert.throws(() => new CachedEmbedder({ cachePath }), /embed or embedBatch/);
+});
+
+test('cached embedder: dimensions are checked on load and on new embeddings', async (t) => {
+  const cachePath = join(tempDir(t), 'cache.json');
+  await new CachedEmbedder({ cachePath, log: () => {}, embed: async (s) => hashEmbedding(s, 4) }).embedMany(['a']);
+  assert.throws(() => new CachedEmbedder({ cachePath, dimensions: 8, embed: async (s) => hashEmbedding(s, 8) }), /4-dimensional vector, expected 8/);
+  const fresh = new CachedEmbedder({ cachePath: join(tempDir(t), 'c.json'), dimensions: 8, log: () => {}, embed: async (s) => hashEmbedding(s, 4) });
+  await assert.rejects(fresh.embedMany(['b']), /embedding provider has a 4-dimensional vector/);
+});
+
+test('truncation never splits a surrogate pair', () => {
+  assert.equal(truncateText('ab😀c', 3), 'ab');
+  assert.equal(truncateText('ab😀c', 4), 'ab😀');
+  assert.equal(truncateText('abc', 5), 'abc');
+  assert.equal(truncateText('abc'), 'abc');
+});

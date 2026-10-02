@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Scratch output from `npm run check:dist`
+.dist-check/
+
+# Packed tarballs
+*.tgz
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Logs
+npm-debug.log*
+*.log
+
+# Environment
+.env
+.env.*
+
+# Coverage
+coverage/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

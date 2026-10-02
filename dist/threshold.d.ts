@@ -1,0 +1,45 @@
+/**
+ * Per-head policies: how a head's threshold is chosen on the calibration split and which gates it
+ * must pass on the test split.
+ *
+ *   recall     for heads where a miss is the costly error. The threshold is the highest that
+ *              reaches `designRecall` on calibration positives, set deliberately above the
+ *              gate's `targetRecall`, so a test set from the same distribution doesn't land either
+ *              side of the gate at random. It is capped so that at most `maxFalseAlarm` of
+ *              calibration negatives fire: without the cap, one mislabelled or very hard positive
+ *              can drag the threshold to ~0 and the head fires on everything. With it, a model that
+ *              can't reach the target within the budget fails its recall gate openly.
+ *   precision  for heads where a false alarm is the costly error. The threshold is the target
+ *              precision itself: for calibrated probabilities, messages scored >= t are on average
+ *              at least t likely to be positive.
+ */
+export type HeadPolicy = {
+    kind: 'recall';
+    /** Test-split gate. */
+    targetRecall: number;
+    /** Threshold selection target on the calibration split (>= targetRecall). */
+    designRecall: number;
+    /** Highest share of calibration negatives allowed to fire (default 1: no cap). */
+    maxFalseAlarm?: number;
+    /** Gate: minimum test positives for the CI to mean anything (default 0). */
+    minPositives?: number;
+    /** Gate: lower bound of the recall 95% Wilson CI (default none). */
+    minRecallLower?: number;
+    /** Warning when test positives come from fewer distinct groups (default none). */
+    minPositiveGroups?: number;
+    /** Gate, when a baseline is supplied: must catch something the baseline misses (default true). */
+    mustBeatBaseline?: boolean;
+} | {
+    kind: 'precision';
+    targetPrecision: number;
+    /** Gate: minimum test examples the head must fire on for its precision to mean anything (default none; warns below 30). */
+    minFired?: number;
+};
+export declare function pickThreshold(policy: HeadPolicy, p: ArrayLike<number>, y: ArrayLike<number>): number;
+/**
+ * Raises (never lowers) a threshold until at most `maxRate` of `background` scores reach it - for a
+ * background of ordinary, mostly-negative traffic whose false alarms the labelled data can't show.
+ */
+export declare function budgetThreshold(threshold: number, background: ArrayLike<number>, maxRate: number): number;
+/** Smallest double strictly greater than v, so `p >= threshold` excludes v itself. */
+export declare function nextUp(v: number): number;

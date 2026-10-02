@@ -1,0 +1,14 @@
+export { calibrate, headProbability, scoreEmbedding, validateArtifact } from './artifact.ts';
+export type { Calibration, ClassifierArtifact, EmbeddingSpec, GateResult, HeadSpec, Scores } from './artifact.ts';
+export { decide, missingPolicyHeads } from './decide.ts';
+export type { Decision, DecisionPolicy, DecisionReason } from './decide.ts';
+export { budgetThreshold, nextUp, pickThreshold } from './threshold.ts';
+export type { HeadPolicy } from './threshold.ts';
+export { evaluateHead } from './evaluate.ts';
+export type { BaselineComparison, EvaluateInput, HeadEvaluation } from './evaluate.ts';
+export { gateHead } from './gates.ts';
+export { assertRoundTrip, SPLITS, trainHeads } from './train.ts';
+export type { HeadInput, Split, TrainInput, TrainResult } from './train.ts';
+export { loadOrder, publishPlan, refuseToServe } from './lifecycle.ts';
+export type { ArtifactRole, ServeMode } from './lifecycle.ts';
+export { reportMarkdown } from './report.ts';

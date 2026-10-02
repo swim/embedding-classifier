@@ -1,7 +1,6 @@
 {
   "name": "@liquidau/embedding-classifier",
   "version": "0.2.0",
-  "private": true,
   "license": "UNLICENSED",
   "description": "Calibrated multi-head classifiers on text embeddings: train a calibrated logistic head per label, pick thresholds from recall or precision targets, evaluate with confidence intervals, slices and a baseline, gate, ship a JSON artifact, and score and decide at runtime with a priority and suppression policy.",
   "keywords": [
@@ -34,19 +33,21 @@
     "README.md"
   ],
   "scripts": {
-    "setup": "npm --prefix ../solvers install --omit=dev --no-package-lock && npm install",
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "prepack": "npm run build",
-    "test": "node --import tsx --conditions=@liquidau/source --test test/*.test.ts",
+    "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check:dist": "rm -rf .dist-check && tsc -p tsconfig.build.json --outDir .dist-check && diff -r dist .dist-check; s=$?; rm -rf .dist-check; exit $s"
   },
   "dependencies": {
-    "@liquidau/solvers": "file:../solvers"
+    "@liquidau/solvers": "^0.2.0"
   },
   "devDependencies": {
     "@types/node": "^20.19.0",
     "tsx": "^4.19.0",
     "typescript": "^5.9.0"
+  },
+  "publishConfig": {
+    "access": "restricted"
   }
 }

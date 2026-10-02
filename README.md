@@ -76,12 +76,12 @@ between training and runtime), the baseline, the decision policy, and what happe
 
 ## Develop
 
-`@liquidau/solvers` is linked from the sibling `../solvers` directory. npm does not install a linked
-package's own dependencies, so the first install is two steps:
+`@liquidau/solvers` is a private package on the npm registry, so you need to be logged in as a member
+of the `@liquidau` org (or have a read token in `.npmrc`) to install.
 
 ```bash
-npm run setup   # installs ../solvers' runtime deps, then this package's
-npm test        # runs from source (export condition "@liquidau/source")
+npm install
+npm test        # runs this package's .ts sources; @liquidau/solvers resolves to its built dist
 npm run typecheck
 npm run build   # dist/ (ESM + .d.ts)
 npm run check:dist  # fails if the checked-in dist/ differs from a fresh build

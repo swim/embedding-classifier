@@ -12,6 +12,46 @@ export interface HeadInput<H extends string> {
     prevalence: number;
     /** Whether an existing mechanism already catches each example (see evaluateHead). */
     baseline?: readonly boolean[];
+    /**
+     * Extra POSITIVES for the train split only, e.g. rule-miner's weakLabels(): embeddings with a
+     * weight in [0, 1] each. They never reach calibration, test or the background budget, and an
+     * embedding identical to a calibration, test or background row is refused as leakage.
+     */
+    weak?: WeakInput;
+    /**
+     * Cap on total weak weight as a multiple λ of the head's gold train positives (default 0.5): weak
+     * weights are scaled down to fit. Class balancing is sample-weighted, so weak positives take a
+     * share λ / (1 + λ) of the positive class's weight rather than adding to it.
+     */
+    maxWeakShare?: number;
+}
+export interface WeakInput {
+    X: ReadonlyArray<ArrayLike<number>>;
+    weights: readonly number[];
+    /** Which rule produced each example, for the per-rule report. */
+    rules?: readonly string[];
+    /** The rule set the weak labels came from, recorded for audit. */
+    source?: {
+        rule_set_version: string;
+        rule_set_hash: string;
+    };
+}
+/** What weak supervision contributed to one head - store as artifact.training.weak_labels. */
+export interface WeakSummary {
+    count: number;
+    gold_train_positives: number;
+    max_weak_share: number;
+    weight_before_cap: number;
+    /** After the cap: at most max_weak_share × gold_train_positives. */
+    weight: number;
+    /** Multiplier the cap applied to every weak weight (1 = no cap). */
+    scale: number;
+    by_rule?: Record<string, {
+        count: number;
+        weight: number;
+    }>;
+    rule_set_version?: string;
+    rule_set_hash?: string;
 }
 export interface TrainInput<H extends string> {
     X: ReadonlyArray<ArrayLike<number>>;
@@ -47,6 +87,8 @@ export interface TrainResult<H extends string> {
         idx: number[];
         p: number[];
     }>>;
+    /** Heads trained with weak positives - store as artifact.training.weak_labels so a release can be audited. */
+    weakLabels: Partial<Record<H, WeakSummary>>;
 }
 export declare function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<H>;
 /**

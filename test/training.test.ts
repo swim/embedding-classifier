@@ -16,6 +16,7 @@ import {
   type ClassifierArtifact,
   type HeadPolicy,
   type Split,
+  type WeakInput,
 } from '../src/index.ts';
 
 /** A temporary directory removed when the test finishes. */
@@ -250,4 +251,43 @@ test('truncation never splits a surrogate pair', () => {
   assert.equal(truncateText('ab😀c', 4), 'ab😀');
   assert.equal(truncateText('abc', 5), 'abc');
   assert.equal(truncateText('abc'), 'abc');
+});
+
+test('trainHeads: weak positives are capped, train-only, and reported', () => {
+  const { X, y, split } = dataset(1200);
+  const base = trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: precision }] });
+  assert.deepEqual(base.weakLabels, {});
+  const fresh = dataset(400, 7);
+  const weakX = fresh.X.filter((_, i) => fresh.y[i] === 1);
+  const weak = { X: weakX, weights: weakX.map(() => 0.9), rules: weakX.map((_, i) => (i % 2 ? 'risk.r1' : 'risk.r2')), source: { rule_set_version: 'v1', rule_set_hash: 'abc123' } };
+  const lines: string[] = [];
+  const result = trainHeads({ X, split, log: (l) => lines.push(l), heads: [{ name: 'h', y, prevalence: 0.05, policy: precision, weak, maxWeakShare: 0.25 }] });
+  const s = result.weakLabels.h!;
+  const gold = y.filter((v, i) => v === 1 && split[i] === 'train').length;
+  assert.equal(s.count, weakX.length);
+  assert.equal(s.gold_train_positives, gold);
+  assert.ok(Math.abs(s.weight - 0.25 * gold) < 1e-9 && s.scale < 1, `weight ${s.weight} capped at 0.25 × ${gold}`);
+  assert.equal(s.by_rule!['risk.r1'].count + s.by_rule!['risk.r2'].count, weakX.length);
+  assert.equal(s.rule_set_hash, 'abc123');
+  assert.ok(lines.some((l) => l.includes('weak positives')));
+  assert.notDeepEqual(result.heads.h!.weights, base.heads.h!.weights, 'weak positives change the fit');
+  const uncapped = trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: precision, weak: { X: weakX.slice(0, 3), weights: [0.5, 0.5, 0.5] } }] });
+  assert.equal(uncapped.weakLabels.h!.scale, 1);
+
+  const artifact: ClassifierArtifact<'h'> = { version: 'v', created_at: '', embedding: { model_id: 't', dimensions: 8, normalize: false }, heads: result.heads, evaluation: result.evaluation, training: { weak_labels: result.weakLabels } };
+  assertRoundTrip(artifact, X, result.testProbabilities);
+  const report = reportMarkdown(artifact);
+  assert.match(report, /Weak positives \(train only\): \d+, weight .* from rule set v1 \(abc123\)/);
+  assert.match(report, /\| risk\.r1 \| \d+ \|/);
+
+  const head = (w: WeakInput) => () => trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: precision, weak: w }] });
+  const testRow = X[split.indexOf('test')];
+  assert.throws(head({ ...weak, X: [testRow], weights: [1], rules: undefined }), /weak.X\[0\] is a calibration, test or background example/);
+  assert.throws(head({ ...weak, weights: weak.weights.map(() => 1.5) }), /weak.weights\[0\] must be in \[0, 1\]/);
+  assert.throws(head({ ...weak, X: [[1, 2]], weights: [1], rules: undefined }), /weak.X\[0\] has 2 dimensions but X has 8/);
+  assert.throws(head({ ...weak, rules: ['x'] }), /weak.rules has 1 entries/);
+  const trainRow = X[split.indexOf('train')];
+  assert.doesNotThrow(head({ X: [trainRow], weights: [1] }), 'a train row may also be a weak example');
+  const withBackground = () => trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: precision, weak: { X: [weakX[0]], weights: [1] } }], background: { X: [weakX[0]], maxRate: {} } });
+  assert.throws(withBackground, /background example/);
 });

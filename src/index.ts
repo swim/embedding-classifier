@@ -8,7 +8,7 @@ export { evaluateHead } from './evaluate.ts';
 export type { BaselineComparison, EvaluateInput, HeadEvaluation } from './evaluate.ts';
 export { gateHead } from './gates.ts';
 export { assertRoundTrip, SPLITS, trainHeads } from './train.ts';
-export type { HeadInput, Split, TrainInput, TrainResult } from './train.ts';
+export type { HeadInput, Split, TrainInput, TrainResult, WeakInput, WeakSummary } from './train.ts';
 export { loadOrder, publishPlan, refuseToServe } from './lifecycle.ts';
 export type { ArtifactRole, ServeMode } from './lifecycle.ts';
 export { reportMarkdown } from './report.ts';

@@ -1,6 +1,7 @@
 /** A Markdown report of an artifact's gates and per-head evaluation, for humans and review. */
 import type { ClassifierArtifact, HeadSpec } from './artifact.ts';
 import type { HeadEvaluation } from './evaluate.ts';
+import type { WeakSummary } from './train.ts';
 
 // The evaluation comes from storage (typed unknown on the artifact), so every field may be missing.
 const fmt = (digits: number) => (v: unknown) => (typeof v !== 'number' ? 'n/a' : Number.isNaN(v) ? 'nan' : v.toFixed(digits));
@@ -40,6 +41,18 @@ export function reportMarkdown(artifact: ClassifierArtifact, options: { title?: 
         `| false-alarm rate with the ${baselineName} | ${f3(ev.combined_false_alarm_rate)} |`,
         '', `vs ${baselineName} (test positives): ` + Object.entries(ev.vs_baseline).map(([k, v]) => `${k} ${v}`).join(', '),
       );
+    }
+    const weak = ((artifact.training?.weak_labels ?? {}) as Record<string, Partial<WeakSummary> | undefined>)[head];
+    if (weak) {
+      lines.push(
+        '', `Weak positives (train only): ${weak.count ?? 'n/a'}, weight ${f3(weak.weight)} beside ${weak.gold_train_positives ?? 'n/a'} gold ` +
+          `(cap ${weak.max_weak_share ?? 'n/a'}×, scale ${f3(weak.scale)})` + (weak.rule_set_version ? ` from rule set ${weak.rule_set_version} (${String(weak.rule_set_hash).slice(0, 12)})` : ''),
+      );
+      const rules = Object.entries(weak.by_rule ?? {});
+      if (rules.length) {
+        lines.push('', '| rule | weak examples | weight |', '|---|---|---|');
+        for (const [rule, r] of rules) lines.push(`| ${rule} | ${r.count} | ${f3(r.weight)} |`);
+      }
     }
     lines.push('', '| slice | positives | recall (95% CI) |', '|---|---|---|');
     for (const [name, s] of Object.entries(ev.slices ?? {})) lines.push(`| ${name} | ${s.positives} | ${f3(s.recall)} (${ci(s.recall_ci95)}) |`);

@@ -1,5 +1,6 @@
-export type ThresholdMode = 'heuristic' | 'conformal-expected' | 'conformal-pac' | 'auto';
-export type GuaranteeKind = 'pac' | 'expected' | 'none';
+/** `design`: designRiskThreshold on a probability-sampled calibration set (see trainHeads `records`). */
+export type ThresholdMode = 'heuristic' | 'conformal-expected' | 'conformal-pac' | 'auto' | 'design';
+export type GuaranteeKind = 'pac' | 'expected' | 'design-exact' | 'design-approximate' | 'none';
 export declare const THRESHOLD_MODES: readonly ThresholdMode[];
 /**
  * One score per group, for calibration: paraphrases of one seed aren't exchangeable, so a group
@@ -14,8 +15,10 @@ export interface Guarantee {
     kind: GuaranteeKind;
     /** Miss rate guaranteed: 1 - targetRecall. */
     alpha: number;
-    /** Family-wise: recall and every false-alarm budget hold together with probability 1 - delta (PAC only). */
+    /** Family-wise: recall and every false-alarm budget hold together with probability 1 - delta (PAC and design guarantees). */
     delta?: number;
+    /** Design guarantees: the estimator behind the bound. */
+    method?: 'exact' | 'linearised' | 'bootstrap';
     /** Certified share of calibration negatives that may fire (from maxFalseAlarm). */
     false_alarm?: number;
     /** Certified share of background text that may fire (from the background budget). */
@@ -62,7 +65,7 @@ export interface ConformalSelection {
  * fails when the false-alarm budget is what rules PAC out.
  */
 export declare function conformalThreshold(input: {
-    mode: Exclude<ThresholdMode, 'heuristic'>;
+    mode: Exclude<ThresholdMode, 'heuristic' | 'design'>;
     targetRecall: number;
     delta?: number;
     /** One calibrated score per calibration positive group (see groupScores). */

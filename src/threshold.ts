@@ -44,6 +44,8 @@ export type HeadPolicy =
        * safety-critical heads). Falling back from PAC to an expected guarantee is always allowed.
        */
       allowHeuristicFallback?: boolean;
+      /** design mode: the bound behind the guarantee (default 'exact'; see solvers' designRiskThreshold). */
+      designMethod?: 'exact' | 'linearised' | 'bootstrap';
       /** Conformal modes: the guarantee fails with probability at most delta (default 0.05), split across recall and every false-alarm budget. */
       delta?: number;
       /** Highest share of calibration negatives allowed to fire (default 1: no cap). */
@@ -64,19 +66,45 @@ export type HeadPolicy =
       minFired?: number;
     };
 
-export function pickThreshold(policy: HeadPolicy, p: ArrayLike<number>, y: ArrayLike<number>): number {
+/**
+ * The heuristic threshold. With `w` (e.g. design weights 1/π from a stratified sample), recall and
+ * the false-alarm share are weighted - unweighted shares of a stratified sample are biased. With
+ * unit weights the result is exactly the unweighted one.
+ */
+export function pickThreshold(policy: HeadPolicy, p: ArrayLike<number>, y: ArrayLike<number>, w?: ArrayLike<number>): number {
   if (policy.kind === 'precision') return policy.targetPrecision;
   if (policy.designRecall === undefined) throw new Error('designRecall is required for a heuristic recall threshold');
   if (policy.designRecall < policy.targetRecall) throw new Error('designRecall must be >= targetRecall');
-  const scored = Array.from(p);
-  const positives = scored.filter((_, i) => y[i] === 1).sort((a, b) => b - a);
+  const scored = Array.from(p, (v, i) => ({ v, w: w ? w[i] : 1, y: y[i] }));
+  const positives = scored.filter((s) => s.y === 1).sort((a, b) => b.v - a.v);
   if (!positives.length) throw new Error('no positives to choose a recall threshold from');
-  const recallThreshold = positives[Math.max(1, Math.ceil(policy.designRecall * positives.length)) - 1];
-  const negatives = scored.filter((_, i) => y[i] === 0).sort((a, b) => b - a);
-  const allowed = Math.floor((policy.maxFalseAlarm ?? 1) * negatives.length);
-  // The lowest threshold at which at most `allowed` negatives are >= it.
-  const budgetThreshold = allowed < negatives.length ? nextUp(negatives[allowed]) : 0;
-  return Math.max(recallThreshold, budgetThreshold);
+  let recallThreshold: number;
+  if (!w) recallThreshold = positives[Math.max(1, Math.ceil(policy.designRecall * positives.length)) - 1].v;
+  else {
+    // The highest score at which the weighted share of positives at or above it reaches designRecall.
+    const total = positives.reduce((s, x) => s + x.w, 0);
+    let cum = 0, j = 0;
+    for (; j < positives.length; j++) { cum += positives[j].w; if (cum / total >= policy.designRecall - 1e-12) break; }
+    recallThreshold = positives[Math.min(j, positives.length - 1)].v;
+  }
+  return Math.max(recallThreshold, falseAlarmCap(p, y, policy.maxFalseAlarm ?? 1, w));
+}
+
+/**
+ * The lowest threshold at which at most a share maxFalseAlarm of the negatives (weighted by `w`
+ * when given) score at or above it.
+ */
+export function falseAlarmCap(p: ArrayLike<number>, y: ArrayLike<number>, maxFalseAlarm: number, w?: ArrayLike<number>): number {
+  const negatives = Array.from(p, (v, i) => ({ v, w: w ? w[i] : 1, y: y[i] })).filter((s) => s.y === 0).sort((a, b) => b.v - a.v);
+  let allowed: number;
+  if (!w) allowed = Math.floor(maxFalseAlarm * negatives.length);
+  else {
+    const total = negatives.reduce((s, x) => s + x.w, 0);
+    let cum = 0;
+    allowed = 0;
+    while (allowed < negatives.length && (cum + negatives[allowed].w) / total <= maxFalseAlarm + 1e-12) cum += negatives[allowed++].w;
+  }
+  return allowed < negatives.length ? nextUp(negatives[allowed].v) : 0;
 }
 
 /**

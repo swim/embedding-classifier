@@ -1,9 +1,14 @@
 export { calibrate, headProbability, scoreEmbedding, validateArtifact } from "./artifact.js";
 export { decide, missingPolicyHeads } from "./decide.js";
-export { budgetThreshold, nextUp, pickThreshold } from "./threshold.js";
+export { budgetThreshold, falseAlarmCap, nextUp, pickThreshold } from "./threshold.js";
 export { evaluateHead } from "./evaluate.js";
 export { gateHead } from "./gates.js";
 export { assertRoundTrip, SPLITS, trainHeads } from "./train.js";
 export { loadOrder, publishPlan, refuseToServe } from "./lifecycle.js";
 export { reportMarkdown } from "./report.js";
 export { conformalThreshold, groupScores, THRESHOLD_MODES } from "./conformal.js";
+export { applyReviews, designOf, designSample, labelQueue, stableId } from "./design.js";
+export { capTrainingWeights, isReal, ProvenanceError, validateProvenance } from "./records.js";
+export { mmrSelect, retrieveFromSeeds, seedStats } from "./retrieval.js";
+export { realHardNegatives, selectForReview, verifyBatch } from "./hardnegatives.js";
+export { checkSliceAxes, coverageReport, defineAxes } from "./coverage.js";

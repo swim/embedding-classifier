@@ -1,8 +1,8 @@
 /**
  * Turning scores into one decision. Heads are checked in priority order and the first at or above
  * its threshold wins. Suppression rules stop some heads from firing while others are in their
- * review band. That is how "never send a possibly-at-risk user a dismissive 'out of scope' reply"
- * is expressed: suppress the scope heads whenever any risk head is at or above its review floor.
+ * review band. That is how "never send a possibly urgent message a dismissive 'out of scope' reply"
+ * is expressed: suppress the scope heads whenever any priority head is at or above its review floor.
  */
 import type { ClassifierArtifact, Scores } from './artifact.ts';
 

@@ -42,10 +42,17 @@ export function publishPlan(options: {
   shadowCandidate?: boolean;
   allowFailingGates?: boolean;
   blockedReason?: string;
+  /** The artifact was trained on generated records (TrainResult.provenance.generated). */
+  generated?: boolean;
+  /** For a generated-data artifact: the shadow evaluation that met the acceptance criteria. Store it in the artifact. */
+  acceptanceEvidence?: unknown;
 }): { error: string } | { role: ArtifactRole | null } {
-  const { gatesPassed, promote = false, shadowCandidate = false, allowFailingGates = false, blockedReason } = options;
+  const { gatesPassed, promote = false, shadowCandidate = false, allowFailingGates = false, blockedReason, generated = false, acceptanceEvidence } = options;
   if (blockedReason) return { error: `refusing to publish: ${blockedReason}` };
   if (promote && shadowCandidate) return { error: 'choose one of promote or shadow-candidate' };
+  if (promote && generated && (acceptanceEvidence === undefined || acceptanceEvidence === null)) {
+    return { error: 'refusing to promote an artifact trained on generated data without acceptance evidence from its shadow evaluation' };
+  }
   if (promote) return gatesPassed ? { role: 'promoted' } : { error: 'refusing to promote an artifact that failed its gates (publish it as a shadow candidate to evaluate it in shadow mode)' };
   if (shadowCandidate) return { role: 'shadow-candidate' };
   if (!gatesPassed && !allowFailingGates) return { error: 'refusing to publish: gates failed (allow failing gates to upload for inspection only, or publish as a shadow candidate)' };

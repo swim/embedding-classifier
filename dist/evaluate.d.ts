@@ -22,6 +22,28 @@ export interface CertifiedBounds {
     false_alarm_upper: number;
     /** At the head's production prevalence: π·R_L / (π·R_L + (1 - π)·FA_U). */
     precision_lower?: number;
+    /** 'exact': Clopper-Pearson on an equal-probability test set. 'design-linearised': one-sided normal bounds from a stratified sample - approximate. */
+    method?: 'exact' | 'design-linearised';
+}
+export interface DesignEstimate {
+    estimate: number;
+    se: number;
+    /** Linearised, estimate ± 1.96·se clipped to [0, 1]. */
+    ci95: [number, number];
+    /** Rao-Wu bootstrap percentile interval. */
+    bootstrap_ci95?: [number, number];
+}
+/** Design-based (Horvitz-Thompson) estimates from a stratified probability sample. Approximate. */
+export interface DesignEvaluation {
+    recall: DesignEstimate;
+    /** At production prevalence: the design weights reproduce it. */
+    precision: DesignEstimate | null;
+    false_alarm_rate: DesignEstimate;
+    prevalence: DesignEstimate;
+    slices: Record<string, DesignEstimate>;
+    /** Kish effective number of positives - what the gates' minimums count. */
+    effective_positives: number;
+    replicates: number;
 }
 export interface BaselineComparison {
     caught_by_both: number;
@@ -59,6 +81,8 @@ export interface HeadEvaluation {
     /** Exact upper bound on the background firing rate (probability 1 - delta/2), valid even when the background chose the threshold. */
     background_rate_upper?: number;
     certified: CertifiedBounds;
+    /** Present when the test set is a probability sample: recall, precision and false alarms above are these estimates. */
+    design?: DesignEvaluation;
     /** Recall heads: what the shipped threshold guarantees from calibration, and why. */
     guarantee?: Guarantee;
     sufficiency?: Sufficiency;
@@ -80,5 +104,17 @@ export interface EvaluateInput {
     delta?: number;
     /** Production prevalence, for certified.precision_lower. */
     prevalence?: number;
+    /**
+     * The test set's stratified design (designOf on the sampled test records), aligned with p.
+     * Recall, precision, false-alarm rate and their intervals then become design-based estimates;
+     * pass w = 1/π so ECE is weighted too.
+     */
+    design?: {
+        inclusionProbs: readonly number[];
+        strata: readonly string[];
+        stratumSizes: Readonly<Record<string, number>>;
+        replicates?: number;
+        seed?: number;
+    };
 }
-export declare function evaluateHead({ p, y, w, threshold, groups, slices, baseline, delta, prevalence }: EvaluateInput): HeadEvaluation;
+export declare function evaluateHead({ p, y, w, threshold, groups, slices, baseline, delta, prevalence, design }: EvaluateInput): HeadEvaluation;

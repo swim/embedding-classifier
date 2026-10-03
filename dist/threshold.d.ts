@@ -40,6 +40,8 @@ export type HeadPolicy = {
      * safety-critical heads). Falling back from PAC to an expected guarantee is always allowed.
      */
     allowHeuristicFallback?: boolean;
+    /** design mode: the bound behind the guarantee (default 'exact'; see solvers' designRiskThreshold). */
+    designMethod?: 'exact' | 'linearised' | 'bootstrap';
     /** Conformal modes: the guarantee fails with probability at most delta (default 0.05), split across recall and every false-alarm budget. */
     delta?: number;
     /** Highest share of calibration negatives allowed to fire (default 1: no cap). */
@@ -58,7 +60,17 @@ export type HeadPolicy = {
     /** Gate: minimum test examples the head must fire on for its precision to mean anything (default none; warns below 30). */
     minFired?: number;
 };
-export declare function pickThreshold(policy: HeadPolicy, p: ArrayLike<number>, y: ArrayLike<number>): number;
+/**
+ * The heuristic threshold. With `w` (e.g. design weights 1/π from a stratified sample), recall and
+ * the false-alarm share are weighted - unweighted shares of a stratified sample are biased. With
+ * unit weights the result is exactly the unweighted one.
+ */
+export declare function pickThreshold(policy: HeadPolicy, p: ArrayLike<number>, y: ArrayLike<number>, w?: ArrayLike<number>): number;
+/**
+ * The lowest threshold at which at most a share maxFalseAlarm of the negatives (weighted by `w`
+ * when given) score at or above it.
+ */
+export declare function falseAlarmCap(p: ArrayLike<number>, y: ArrayLike<number>, maxFalseAlarm: number, w?: ArrayLike<number>): number;
 /**
  * Raises (never lowers) a threshold until at most `maxRate` of `background` scores reach it - for a
  * background of ordinary, mostly-negative traffic whose false alarms the labelled data can't show.

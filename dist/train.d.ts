@@ -1,3 +1,5 @@
+import { type DesignSummary } from './design.ts';
+import { type ExampleRecord, type ProvenanceCode, type ProvenanceOptions, type WeightCaps, type WeightCapSummary } from './records.ts';
 import { type ClassifierArtifact, type HeadSpec } from './artifact.ts';
 import { type HeadEvaluation } from './evaluate.ts';
 import { type HeadPolicy } from './threshold.ts';
@@ -8,8 +10,13 @@ export interface HeadInput<H extends string> {
     /** Binary target per example, aligned with X; null leaves the example out of this head. */
     y: ReadonlyArray<0 | 1 | null>;
     policy: HeadPolicy;
-    /** Expected positive rate in production - calibration and precision are weighted to it. */
-    prevalence: number;
+    /**
+     * Expected positive rate in production - calibration and precision are weighted to it. Required
+     * without `records`; must be omitted with them (design weights already reproduce prevalence).
+     */
+    prevalence?: number;
+    /** Generated records labelled for this head must each be human-verified (P7). Recorded in the provenance summary. */
+    safetyCritical?: boolean;
     /** Whether an existing mechanism already catches each example (see evaluateHead). */
     baseline?: readonly boolean[];
     /**
@@ -79,8 +86,41 @@ export interface TrainInput<H extends string> {
     background?: {
         X: ReadonlyArray<ArrayLike<number>>;
         maxRate: Partial<Record<H, number>>;
+        /** With `records`: one per row of background.X - unlabelled traffic with backgroundUse 'budget' (P2). */
+        records?: readonly ExampleRecord[];
     };
+    /**
+     * One record per row of X: role must equal split, and labels[head] must equal each head's y.
+     * Turns on provenance enforcement, record weights with P6 caps, and design-based calibration
+     * and evaluation (see the module comment).
+     */
+    records?: readonly ExampleRecord[];
+    /** The designSample summaries behind the sampled records - recorded in result.design. */
+    designs?: readonly DesignSummary[];
+    /** Overrides, accepted batches and the near-duplicate cosine for validateProvenance. */
+    provenance?: Omit<ProvenanceOptions, 'embeddings' | 'safetyCritical'>;
+    /** P6 caps; ruleMatches is required when generated hard negatives are present. */
+    caps?: WeightCaps;
+    /** Seed for design bootstraps (default 0). */
+    seed?: number;
     log?: (line: string) => void;
+}
+/** What provenance enforcement did - store as artifact.training.provenance (with generated, see publishPlan). */
+export interface ProvenanceSummary {
+    dropped: Array<{
+        id: string;
+        code: 'P5';
+        reason: string;
+    }>;
+    overridden: Array<{
+        code: ProvenanceCode;
+        ids: string[];
+        message: string;
+    }>;
+    /** Any generated record was trained on: the artifact may only be a shadow candidate until acceptance evidence exists. */
+    generated: boolean;
+    safety_critical: string[];
+    heads: Record<string, WeightCapSummary>;
 }
 export interface TrainResult<H extends string> {
     heads: Partial<Record<H, HeadSpec>>;
@@ -95,6 +135,17 @@ export interface TrainResult<H extends string> {
     }>>;
     /** Heads trained with weak positives - store as artifact.training.weak_labels so a release can be audited. */
     weakLabels: Partial<Record<H, WeakSummary>>;
+    /** With records: provenance enforcement - store as artifact.training.provenance. */
+    provenance?: ProvenanceSummary;
+    /** With sampled records: the designs and each head's estimator - store as artifact.training.design. */
+    design?: {
+        designs: DesignSummary[];
+        heads: Record<string, {
+            calibration: 'design-weighted';
+            threshold: string;
+            evaluation: 'design-linearised';
+        }>;
+    };
 }
 export declare function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<H>;
 /**

@@ -123,10 +123,11 @@ const isRate = (v: unknown) => isFiniteNumber(v) && v > 0 && v < 1;
 function validateGuarantee(name: string, g: Guarantee): void {
   if (!g || typeof g !== 'object' || !THRESHOLD_MODES.includes(g.mode)) throw new Error(`head ${name} has an unknown threshold mode ${g?.mode}`);
   if (!isRate(g.alpha)) throw new Error(`head ${name}: guarantee alpha must be in (0, 1)`);
-  const allowed: Record<string, readonly string[]> = { heuristic: ['none'], 'conformal-expected': ['expected', 'none'], 'conformal-pac': ['pac', 'none'], auto: ['pac', 'expected', 'none'] };
+  const allowed: Record<string, readonly string[]> = { heuristic: ['none'], 'conformal-expected': ['expected', 'none'], 'conformal-pac': ['pac', 'none'], auto: ['pac', 'expected', 'none'], design: ['design-exact', 'design-approximate', 'none'] };
   if (!allowed[g.mode].includes(g.kind)) throw new Error(`head ${name}: mode ${g.mode} cannot give a ${g.kind} guarantee`);
-  if (g.kind === 'pac' && !isRate(g.delta)) throw new Error(`head ${name}: a pac guarantee needs delta in (0, 1)`);
-  if (g.kind !== 'pac' && g.delta !== undefined) throw new Error(`head ${name}: only a pac guarantee has a delta`);
+  const withDelta = g.kind === 'pac' || g.kind === 'design-exact' || g.kind === 'design-approximate';
+  if (withDelta && !isRate(g.delta)) throw new Error(`head ${name}: a ${g.kind} guarantee needs delta in (0, 1)`);
+  if (!withDelta && g.delta !== undefined) throw new Error(`head ${name}: only pac and design guarantees have a delta`);
   for (const k of ['false_alarm', 'background_rate'] as const) {
     if (g[k] !== undefined && (g.kind === 'none' || !isRate(g[k]))) throw new Error(`head ${name}: guarantee ${k} must be in (0, 1) and only with a guarantee`);
   }

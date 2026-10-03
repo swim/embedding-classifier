@@ -36,6 +36,10 @@ export declare function publishPlan(options: {
     shadowCandidate?: boolean;
     allowFailingGates?: boolean;
     blockedReason?: string;
+    /** The artifact was trained on generated records (TrainResult.provenance.generated). */
+    generated?: boolean;
+    /** For a generated-data artifact: the shadow evaluation that met the acceptance criteria. Store it in the artifact. */
+    acceptanceEvidence?: unknown;
 }): {
     error: string;
 } | {

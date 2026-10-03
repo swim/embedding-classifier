@@ -4,12 +4,57 @@
  * is supplied, e.g. existing rules) what the classifier adds on top of it, and exact certified
  * bounds for the shipped threshold whatever chose it.
  */
-import { clopperPearsonUpper, ece, wilson } from '@liquidau/solvers';
+import { clopperPearsonUpper, ece, kishEffectiveN, normalQuantile, stratifiedBootstrap, stratifiedRatio, weightedQuantile, wilson } from '@liquidau/solvers';
 const clopperPearsonLower = (k, n, confidence) => 1 - clopperPearsonUpper(n - k, n, confidence);
-export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline, delta = 0.05, prevalence }) {
+function designEvaluation(p, y, fired, design, slices) {
+    const { replicates = 2000, seed = 0 } = design;
+    const reps = replicates > 0 ? stratifiedBootstrap({ inclusionProbs: design.inclusionProbs, strata: design.strata, replicates, seed }) : null;
+    const est = (num, den) => {
+        if (!den.some((d) => d !== 0))
+            return null;
+        const r = stratifiedRatio({ ...design, num, den });
+        const out = { estimate: r.estimate, se: r.se, ci95: [Math.max(0, r.estimate - 1.96 * r.se), Math.min(1, r.estimate + 1.96 * r.se)] };
+        if (reps) {
+            const rs = reps.flatMap((wb) => {
+                let a = 0, b = 0;
+                for (let i = 0; i < wb.length; i++) {
+                    a += wb[i] * num[i];
+                    b += wb[i] * den[i];
+                }
+                return b > 0 ? [a / b] : [];
+            });
+            if (rs.length)
+                out.bootstrap_ci95 = [weightedQuantile(rs, rs.map(() => 1), 0.025), weightedQuantile(rs, rs.map(() => 1), 0.975)];
+        }
+        return out;
+    };
+    const f = fired.map(Number);
+    const recall = est(y.map((v, i) => v * f[i]), [...y]);
+    const falseAlarm = est(y.map((v, i) => (1 - v) * f[i]), y.map((v) => 1 - v));
+    if (!recall || !falseAlarm)
+        throw new Error('a sampled test set needs both positives and negatives');
+    const sliceEstimates = {};
+    for (const [field, values] of Object.entries(slices)) {
+        for (const v of [...new Set(values)].sort()) {
+            const e = est(y.map((yy, i) => (values[i] === v ? yy * f[i] : 0)), y.map((yy, i) => (values[i] === v ? yy : 0)));
+            if (e)
+                sliceEstimates[`${field}=${v}`] = e;
+        }
+    }
+    return {
+        recall,
+        precision: est(y.map((v, i) => v * f[i]), f),
+        false_alarm_rate: falseAlarm,
+        prevalence: est([...y], p.map(() => 1)),
+        slices: sliceEstimates,
+        effective_positives: kishEffectiveN(y.flatMap((v, i) => (v === 1 ? [1 / design.inclusionProbs[i]] : []))),
+        replicates,
+    };
+}
+export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline, delta = 0.05, prevalence, design }) {
     if (!(delta > 0 && delta < 1))
         throw new Error(`delta must be strictly between 0 and 1, got ${delta}`);
-    const lengths = [['y', y], ['w', w], ['groups', groups], ['baseline', baseline], ...Object.entries(slices).map(([f, v]) => [`slices.${f}`, v])];
+    const lengths = [['y', y], ['w', w], ['groups', groups], ['baseline', baseline], ['design.inclusionProbs', design?.inclusionProbs], ['design.strata', design?.strata], ...Object.entries(slices).map(([f, v]) => [`slices.${f}`, v])];
     for (const [name, values] of lengths) {
         if (values !== undefined && values.length !== p.length)
             throw new Error(`${name} has ${values.length} entries but p has ${p.length}`);
@@ -88,5 +133,24 @@ export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline
         result.combined_recall_ci95 = wilson(combined, pos);
         result.combined_false_alarm_rate = neg ? count((i) => y[i] === 0 && (baseline[i] || fired[i])) / neg : NaN;
     }
+    if (design) {
+        const d = designEvaluation(p, y, fired, design, slices);
+        const z = normalQuantile(1 - delta / 2);
+        result.design = d;
+        result.recall = d.recall.estimate;
+        result.recall_ci95 = d.recall.ci95;
+        result.false_alarm_rate = d.false_alarm_rate.estimate;
+        result.precision_prevalence_weighted = d.precision?.estimate ?? NaN;
+        result.certified = {
+            ...certified,
+            method: 'design-linearised',
+            recall_lower: Math.max(0, d.recall.estimate - z * d.recall.se),
+            recall_upper: Math.min(1, d.recall.estimate + z * d.recall.se),
+            false_alarm_upper: Math.min(1, d.false_alarm_rate.estimate + z * d.false_alarm_rate.se),
+            precision_lower: d.precision ? Math.max(0, d.precision.estimate - z * d.precision.se) : undefined,
+        };
+    }
+    else
+        certified.method = 'exact';
     return result;
 }

@@ -21,11 +21,14 @@ export function refuseToServe(mode, artifact) {
  *   allowFailingGates  upload a failing artifact for inspection, without pointing any role at it
  */
 export function publishPlan(options) {
-    const { gatesPassed, promote = false, shadowCandidate = false, allowFailingGates = false, blockedReason } = options;
+    const { gatesPassed, promote = false, shadowCandidate = false, allowFailingGates = false, blockedReason, generated = false, acceptanceEvidence } = options;
     if (blockedReason)
         return { error: `refusing to publish: ${blockedReason}` };
     if (promote && shadowCandidate)
         return { error: 'choose one of promote or shadow-candidate' };
+    if (promote && generated && (acceptanceEvidence === undefined || acceptanceEvidence === null)) {
+        return { error: 'refusing to promote an artifact trained on generated data without acceptance evidence from its shadow evaluation' };
+    }
     if (promote)
         return gatesPassed ? { role: 'promoted' } : { error: 'refusing to promote an artifact that failed its gates (publish it as a shadow candidate to evaluate it in shadow mode)' };
     if (shadowCandidate)

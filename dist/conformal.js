@@ -12,7 +12,7 @@
  * survive calibration (ties from isotonic plateaus only make them more conservative).
  */
 import { conformalLowerThreshold, conformalUpperThreshold, minimumSamples } from '@liquidau/solvers';
-export const THRESHOLD_MODES = ['heuristic', 'conformal-expected', 'conformal-pac', 'auto'];
+export const THRESHOLD_MODES = ['heuristic', 'conformal-expected', 'conformal-pac', 'auto', 'design'];
 function checkRate(name, v) {
     if (!(v > 0 && v < 1))
         throw new Error(`${name} must be strictly between 0 and 1, got ${v}`);

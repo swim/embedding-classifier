@@ -13,9 +13,10 @@
  */
 import { conformalLowerThreshold, conformalUpperThreshold, minimumSamples } from '@liquidau/solvers';
 
-export type ThresholdMode = 'heuristic' | 'conformal-expected' | 'conformal-pac' | 'auto';
-export type GuaranteeKind = 'pac' | 'expected' | 'none';
-export const THRESHOLD_MODES: readonly ThresholdMode[] = ['heuristic', 'conformal-expected', 'conformal-pac', 'auto'];
+/** `design`: designRiskThreshold on a probability-sampled calibration set (see trainHeads `records`). */
+export type ThresholdMode = 'heuristic' | 'conformal-expected' | 'conformal-pac' | 'auto' | 'design';
+export type GuaranteeKind = 'pac' | 'expected' | 'design-exact' | 'design-approximate' | 'none';
+export const THRESHOLD_MODES: readonly ThresholdMode[] = ['heuristic', 'conformal-expected', 'conformal-pac', 'auto', 'design'];
 
 function checkRate(name: string, v: number): void {
   if (!(v > 0 && v < 1)) throw new Error(`${name} must be strictly between 0 and 1, got ${v}`);
@@ -40,8 +41,10 @@ export interface Guarantee {
   kind: GuaranteeKind;
   /** Miss rate guaranteed: 1 - targetRecall. */
   alpha: number;
-  /** Family-wise: recall and every false-alarm budget hold together with probability 1 - delta (PAC only). */
+  /** Family-wise: recall and every false-alarm budget hold together with probability 1 - delta (PAC and design guarantees). */
   delta?: number;
+  /** Design guarantees: the estimator behind the bound. */
+  method?: 'exact' | 'linearised' | 'bootstrap';
   /** Certified share of calibration negatives that may fire (from maxFalseAlarm). */
   false_alarm?: number;
   /** Certified share of background text that may fire (from the background budget). */
@@ -88,7 +91,7 @@ type Plan = { ok: true; threshold: number } | { ok: false; conflict: boolean; th
  * fails when the false-alarm budget is what rules PAC out.
  */
 export function conformalThreshold(input: {
-  mode: Exclude<ThresholdMode, 'heuristic'>;
+  mode: Exclude<ThresholdMode, 'heuristic' | 'design'>;
   targetRecall: number;
   delta?: number;
   /** One calibrated score per calibration positive group (see groupScores). */

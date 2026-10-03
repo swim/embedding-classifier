@@ -6,11 +6,14 @@ export function gateHead(policy, ev, options = {}) {
     const warnings = [];
     if (policy.kind === 'recall') {
         const minPositives = policy.minPositives ?? 0;
-        if (policy.minPositives === undefined && ev.positives < MIN_SUPPORT) {
-            warnings.push(`recall rests on only ${ev.positives} test positives and no minPositives gate is set`);
+        // A stratified test sample counts its Kish effective positives, not rows.
+        const positives = ev.design ? ev.design.effective_positives : ev.positives;
+        const what = ev.design ? `${positives.toFixed(1)} effective test positives` : `${positives} test positives`;
+        if (policy.minPositives === undefined && positives < MIN_SUPPORT) {
+            warnings.push(`recall rests on only ${what} and no minPositives gate is set`);
         }
-        if (ev.positives < minPositives)
-            failures.push(`only ${ev.positives} test positives (need >= ${minPositives} for a meaningful CI)`);
+        if (positives < minPositives)
+            failures.push(`only ${what} (need >= ${minPositives} for a meaningful CI)`);
         if (ev.guarantee && ev.guarantee.kind !== 'none') {
             // The threshold already guarantees recall; a test sample falls below the target by chance
             // about half the time even when it holds. Fail only when the test split contradicts it.

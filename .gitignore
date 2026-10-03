@@ -15,6 +15,8 @@ npm-debug.log*
 *.log
 
 # Environment
+mapie_env/
+.venv/
 .env
 .env.*
 

@@ -29,6 +29,9 @@ embeddings ─► trainHeads ─────────────────
 | `gateHead` | Release gates: minimum positives, recall, CI lower bound, beats the baseline, precision, minimum fired (`minFired`), ECE. Too few distinct groups, or fewer than 30 positives / fired examples with no explicit minimum, produces a warning |
 | `background` (`trainHeads`) / `budgetThreshold` | Raise a head's threshold until it fires on at most a given share of ordinary background traffic, before test evaluation, so the gates judge the shipped threshold. Labelled test sets rarely contain enough ordinary text to show the false alarms that matter |
 | `weak` / `maxWeakShare` (`trainHeads`) | Extra **weak positives** for the train split only (e.g. rule-miner's `weakLabels`), each weighted in [0, 1], total capped at `maxWeakShare` (λ, default 0.5) × the head's gold train positives. An embedding identical to a calibration, test or background row is refused. Class balancing is sample-weighted, so weak positives take λ / (1 + λ) of the positive class's weight instead of adding to it. `weakLabels` in the result (count, weight, cap, per rule, rule-set version and hash) belongs in `artifact.training.weak_labels`, and `reportMarkdown` shows it |
+| `mode` (recall `HeadPolicy`), `conformalThreshold` | How a recall head's threshold is chosen. `heuristic` (default) is the `designRecall` margin and guarantees nothing. `conformal-expected` and `conformal-pac` pick it from order statistics of calibration positives (one per group), so production recall ≥ `targetRecall` in expectation, or with probability 1 − `delta`. `maxFalseAlarm` and any background budget are certified the same way, with δ split across them. If the limits cross, the head fails with the reason. `auto` takes the strongest guarantee the data supports. It falls back for lack of data with an *inconclusive* warning (to no guarantee at all only while `allowHeuristicFallback` is true, the default), and fails rather than drop PAC for the false-alarm budget. `evaluation.sufficiency` says why. Guarantees need each class's calibration examples to be exchangeable with production ones; prevalence may differ |
+| `certified` (`evaluateHead`) | Exact Clopper–Pearson bounds from the test split, valid whatever chose the threshold: recall lower and upper, false-alarm upper, and precision lower at production prevalence. Groups count once. Plus a background-rate upper bound that stays valid when the background set the threshold. Under a conformal guarantee, the recall gate fails only when the test split contradicts it |
+| `reviewEpsilon` (`trainHeads`) | A conformal review floor: at most ε of positives score below it in expectation, so automatic dismissals have a stated miss rate |
 | `assertRoundTrip` | Serialise, reload and re-score the artifact, so what was evaluated is exactly what will run |
 | `validateArtifact`, `scoreEmbedding`, `calibrate` | Runtime loading and scoring. Small and dependency-light |
 | `decide` / `missingPolicyHeads` | Priority order plus suppression rules, e.g. "the scope heads can't fire while any risk head is in its review band". `decide` throws on a missing or non-finite score. Policy heads the artifact lacks never fire or suppress; check them once at startup with `missingPolicyHeads` |
@@ -86,6 +89,9 @@ npm run typecheck
 npm run build   # dist/ (ESM + .d.ts)
 npm run check:dist  # fails if the checked-in dist/ differs from a fresh build
 ```
+
+The conformal threshold statistics live in `@liquidau/solvers` and are verified against MAPIE and
+crepes there. This package decides which guarantee each head gets.
 
 ## License
 

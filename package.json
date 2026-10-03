@@ -49,7 +49,7 @@
     "check:dist": "rm -rf .dist-check && tsc -p tsconfig.build.json --outDir .dist-check && diff -r dist .dist-check; s=$?; rm -rf .dist-check; exit $s"
   },
   "dependencies": {
-    "@liquidau/solvers": "^0.3.0"
+    "@liquidau/solvers": "^0.4.0"
   },
   "devDependencies": {
     "@types/node": "^20.19.0",

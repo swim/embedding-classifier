@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { htTotal, seededRandom, stratifiedRatio } from '@liquidau/solvers';
+import { designRiskThreshold, htTotal, seededRandom, stratifiedRatio } from '@liquidau/solvers';
 
 import {
   applyReviews,
@@ -293,4 +293,58 @@ test('coverage report: pair gaps, slice requirements, observable slices only', (
   assert.throws(() => coverageReport({ head: 'h', records, tags: { c0: { channel: 'fax' } }, axes }), /not a value/);
   const md = reportMarkdown({ version: 'v', created_at: '', embedding: { model_id: 'm', dimensions: 1, normalize: true }, heads: {} }, { coverage: report });
   assert.match(md, /## Coverage: h/);
+});
+
+/** Population A from the allocation study: 5% positives, and the low band holds ~13% of them at ~1%. */
+function rarePositiveFrame(N: number, seed: number) {
+  const rand = seededRandom(seed);
+  return Array.from({ length: N }, (_, i) => {
+    const truth: 0 | 1 = rand() < 0.05 ? 1 : 0;
+    const u = rand();
+    return { id: `a${i}`, text: '', group: `a${i}`, signals: { ruleFires: false, score: truth ? 1 - (1 - u) ** 2.5 : u ** 2.5 }, truth };
+  });
+}
+
+test('expected-positives allocation: proportional shares, sized so every material stratum expects enough positives', () => {
+  const prior = { 'no_rule|band0': { positives: 54, labelled: 420 }, 'no_rule|band1': { positives: 20, labelled: 400 }, 'no_rule|band2': { positives: 15, labelled: 1180 } };
+  const frameA = rarePositiveFrame(30000, 11);
+  const opts = (total: number, extra: object = {}) => ({ frame: frameA, scoreBands: [0.79, 0.59], scoringModel: 'm', seed: 1, allocation: { total, method: 'expected-positives' as const, prior, ...extra } });
+  assert.throws(() => designSample(opts(2000)), /below the (\d+) that proportional allocation needs for every stratum holding >= 0.02 of positives to expect 10 calibration positives/);
+  const required = Number(/the (\d+) that/.exec((() => { try { designSample(opts(1)); return ''; } catch (e) { return (e as Error).message; } })())![1]);
+  // Band 2's share of the frame and its prior rate (15.5 / 1181) set the size: 10 / (0.25 · rate · N2/N).
+  const N2 = designSample({ ...opts(required), allocation: { total: required, method: 'proportional' } }).design.strata.find((s) => s.name === 'no_rule|band2')!.N;
+  assert.equal(required, Math.ceil((10 * 30000) / (0.25 * (15.5 / 1181) * N2)));
+  const d = designSample(opts(required));
+  for (const s of d.design.strata) assert.ok(Math.abs(s.n / s.N - required / 30000) < 0.002, `${s.name}: proportional share`);
+  assert.ok(d.design.strata.every((s) => s.expectedCalibrationPositives! >= 9.5), JSON.stringify(d.design.strata));
+  assert.deepEqual(d.design.allocation.minExpectedPositives, 10);
+  // A stratum below minShare doesn't drive the size.
+  assert.ok(Number(/the (\d+) that/.exec((() => { try { designSample(opts(1, { minShare: 0.2 })); return ''; } catch (e) { return (e as Error).message; } })())![1]) < required);
+  assert.throws(() => designSample(opts(9000, { prior: { 'no_rule|band0': 0.1 } })), /prior has no rate for stratum no_rule\|band1/);
+  assert.throws(() => designSample(opts(9000, { prior: { ...prior, nope: 0.1 } })), /prior names unknown stratum nope/);
+  assert.throws(() => designSample(opts(9000, { prior: { ...prior, 'no_rule|band0': { positives: 5, labelled: 2 } } })), /integer 0 <= positives <= labelled/);
+});
+
+test('allocation coverage: high-score-heavy sampling under-covers; sized proportional allocation holds', () => {
+  const frameA = rarePositiveFrame(30000, 11);
+  const byIdA = new Map(frameA.map((f) => [f.id, f]));
+  const pos = frameA.filter((f) => f.truth).map((f) => f.signals.score).sort((a, b) => a - b);
+  const trueMiss = (t: number) => pos.filter((v) => v < t).length / pos.length;
+  const prior = { 'no_rule|band0': { positives: 54, labelled: 420 }, 'no_rule|band1': { positives: 20, labelled: 400 }, 'no_rule|band2': { positives: 15, labelled: 1180 } };
+  const run = (allocation: object, runs: number) => {
+    let feasible = 0, fails = 0;
+    for (let r = 0; r < runs; r++) {
+      const cal = designSample({ frame: frameA, scoreBands: [0.79, 0.59], scoringModel: 'm', seed: 1000 + r, allocation: allocation as never }).records.filter((x) => x.role === 'calibration');
+      const res = designRiskThreshold({ ...designOf(cal), y: cal.map((x) => byIdA.get(x.id)!.truth), scores: cal.map((x) => byIdA.get(x.id)!.signals.score), alpha: 0.1, delta: 0.05, method: 'linearised' });
+      if (!res.feasible) continue;
+      feasible++;
+      if (trueMiss(res.threshold) > 0.1) fails++;
+    }
+    return { feasible, fails, runs };
+  };
+  const heavy = run({ total: 2000, method: 'manual', manual: { 'no_rule|band0': 1000, 'no_rule|band1': 600, 'no_rule|band2': 400 } }, 80);
+  assert.ok(heavy.fails > 0.2 * heavy.runs, `high-score-heavy: ${heavy.fails} failures in ${heavy.feasible} feasible of ${heavy.runs}`);
+  const sized = run({ total: 5200, method: 'expected-positives', prior }, 80);
+  assert.ok(sized.feasible >= 0.9 * sized.runs, `sized: feasible ${sized.feasible}/${sized.runs}`);
+  assert.ok(sized.fails <= 0.05 * sized.runs + 3 * Math.sqrt(sized.runs * 0.05 * 0.95), `sized: ${sized.fails} failures in ${sized.runs}`);
 });

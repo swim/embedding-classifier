@@ -15,6 +15,16 @@
  *
  * Scores in the frame must come from the text alone (not from labels or outcomes) - designSample
  * can't check this; `scoringModel` records which model produced them so it can be audited.
+ *
+ * Allocation `expected-positives` is proportional allocation SIZED from a prior round: it checks
+ * that `total` is large enough for every material stratum (one estimated to hold at least
+ * `minShare` of all positives) to expect `minExpectedPositives` positives in its calibration and
+ * test shares, throws with the required total if not, and otherwise allocates proportionally.
+ * Proportional shares give every sampled positive the same weight, which maximises the effective
+ * number of positives that design-based recall bounds rest on; in simulation, skewing samples
+ * toward low-score strata instead starved the positive-rich stratum and made targets infeasible,
+ * while a too-small sample of a stratum holding a real share of positives made linearised bounds
+ * under-cover. Rates must come from a PRIOR, independent round, fixed before drawing.
  */
 import { seededRandom, weightedQuantile } from '@liquidau/solvers';
 
@@ -58,10 +68,16 @@ export interface DesignStratum {
   roles: { train: number; calibration: number; test: number };
   /** Score range of the band, [lower, upper). */
   band: [number, number];
+  /** expected-positives: the prior rate used and the positives the calibration share expects. */
+  priorRate?: number;
+  expectedCalibrationPositives?: number;
 }
 
 export interface DesignSummary {
   designId: string;
+  allocation: { method: DesignOptions['allocation']['method']; minExpectedPositives?: number; minShare?: number; priorRates?: Record<string, number> };
+  /** Strata that could not reach minExpectedPositives even when taken whole, and similar notes. */
+  warnings: string[];
   scoringModel: string;
   seed: number;
   /** Frame items removed because their group already had one. */
@@ -75,7 +91,25 @@ export interface DesignOptions {
   scoreBands: readonly number[];
   /** Cross strata with signals.slice (default false). */
   bySlice?: boolean;
-  allocation: { total: number; method: 'proportional' | 'manual'; manual?: Record<string, number> };
+  allocation: {
+    total: number;
+    method: 'proportional' | 'manual' | 'expected-positives';
+    manual?: Record<string, number>;
+    /**
+     * expected-positives: per stratum name, the positive rate from a prior, independent round -
+     * a rate in (0, 1], or counts { positives, labelled } (estimated as (positives + 0.5) / (labelled + 1),
+     * so a stratum with no positives yet still gets a finite, generous size).
+     */
+    prior?: Record<string, number | { positives: number; labelled: number }>;
+    /** expected-positives: positives each stratum's calibration and test shares should expect (default 10). */
+    minExpectedPositives?: number;
+    /**
+     * expected-positives: only strata estimated to hold at least this share of all positives get
+     * the floor (default 0.02). A stratum nearly empty of positives can't move the miss rate much,
+     * and proving it empty would cost most of the stratum.
+     */
+    minShare?: number;
+  };
   /** Default 30. */
   minPerStratum?: number;
   /** Default 0.5 / 0.25 / 0.25. */
@@ -130,11 +164,47 @@ export function designSample(options: DesignOptions): { designId: string; record
   const N = names.map((h) => strata.get(h)!.length);
 
   // 3. Allocate: floors first, then the rest by the chosen method, capped at N_h.
+  const warnings: string[] = [];
+  let rates: number[] | null = null;
+  const minExpected = allocation.minExpectedPositives ?? 10;
+  if (allocation.method === 'expected-positives') {
+    const prior = allocation.prior ?? {};
+    if (!(minExpected > 0)) throw new Error(`minExpectedPositives must be positive, got ${minExpected}`);
+    for (const k of Object.keys(prior)) if (!strata.has(k)) throw new Error(`prior names unknown stratum ${k} (strata: ${names.join(', ')})`);
+    rates = names.map((h) => {
+      const v = prior[h];
+      if (v === undefined) throw new Error(`prior has no rate for stratum ${h}; expected-positives allocation needs one per stratum (strata: ${names.join(', ')})`);
+      const r = typeof v === 'number' ? v : (v.positives + 0.5) / (v.labelled + 1);
+      if (typeof v !== 'number' && !(Number.isInteger(v.positives) && Number.isInteger(v.labelled) && v.positives >= 0 && v.labelled >= v.positives)) throw new Error(`prior for ${h} must have integer 0 <= positives <= labelled`);
+      if (!(r > 0 && r <= 1)) throw new Error(`prior rate for ${h} must be in (0, 1], got ${r}`);
+      return r;
+    });
+  }
+  // Proportional n_h = total · N_h / ΣN, so stratum h's calibration (and test) share expects
+  // total · (N_h / ΣN) · share · rate_h positives: the smallest sufficient total over material strata.
+  const share = Math.min(roleSplit.calibration, roleSplit.test);
+  const minShare = allocation.minShare ?? 0.02;
+  const frameSize = N.reduce((a, b) => a + b, 0);
+  const positivesTotal = rates ? N.reduce((acc, Nh, i) => acc + Nh * rates![i], 0) : 0;
+  const material = N.map((Nh, i) => !!rates && (Nh * rates[i]) / positivesTotal >= minShare);
+  let requiredTotal = 0;
+  if (rates) names.forEach((h, i) => {
+    if (!material[i]) return;
+    const need = Math.ceil((minExpected * frameSize) / (share * rates![i] * N[i]));
+    if (need > frameSize) warnings.push(`stratum ${h}: even the whole frame expects only ${(frameSize * (N[i] / frameSize) * share * rates![i]).toFixed(1)} calibration positives there, below ${minExpected}`);
+    requiredTotal = Math.max(requiredTotal, Math.min(need, frameSize));
+  });
+  if (rates && allocation.total < requiredTotal) {
+    throw new Error(`allocation.total ${allocation.total} is below the ${requiredTotal} that proportional allocation needs for every stratum holding >= ${minShare} of positives to expect ${minExpected} calibration positives`);
+  }
   const floors = N.map((Nh) => Math.min(minPerStratum, Nh));
   const minimum = floors.reduce((a, b) => a + b, 0);
-  if (allocation.total < minimum) throw new Error(`allocation.total ${allocation.total} is below the ${minimum} that minPerStratum ${minPerStratum} needs across ${names.length} strata`);
+  if (allocation.total < minimum) {
+    throw new Error(`allocation.total ${allocation.total} is below the ${minimum} that ${rates ? `minExpectedPositives ${minExpected} and minPerStratum ${minPerStratum} need` : `minPerStratum ${minPerStratum} needs`} across ${names.length} strata`);
+  }
   let n: number[];
   if (allocation.method === 'manual') {
+    // (expected-positives falls through to proportional below, sized by the check above.)
     const manual = allocation.manual ?? {};
     for (const k of Object.keys(manual)) if (!strata.has(k)) throw new Error(`manual allocation names unknown stratum ${k} (strata: ${names.join(', ')})`);
     n = names.map((h, i) => Math.min(N[i], Math.max(floors[i], manual[h] ?? 0)));
@@ -166,9 +236,16 @@ export function designSample(options: DesignOptions): { designId: string; record
       records.push({ id: f.id, text: f.text, group: f.group, role, source, labels: {} });
     });
     const band = bandOf(strata.get(name)![0].signals.score);
-    return { name, N: N[i], n: n[i], pi: n[i] / N[i], roles: counts, band: bandRange(band) };
+    return {
+      name, N: N[i], n: n[i], pi: n[i] / N[i], roles: counts, band: bandRange(band),
+      ...(rates ? { priorRate: rates[i], expectedCalibrationPositives: rates[i] * nCal } : {}),
+    };
   });
-  return { designId, records, design: { designId, scoringModel, seed, duplicatesRemoved, strata: table } };
+  const summary: DesignSummary = {
+    designId, scoringModel, seed, duplicatesRemoved, strata: table, warnings,
+    allocation: { method: allocation.method, ...(rates ? { minExpectedPositives: minExpected, minShare, priorRates: Object.fromEntries(names.map((h, i) => [h, rates![i]])) } : {}) },
+  };
+  return { designId, records, design: summary };
 }
 
 /**

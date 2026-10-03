@@ -27,9 +27,20 @@ export interface DesignStratum {
     };
     /** Score range of the band, [lower, upper). */
     band: [number, number];
+    /** expected-positives: the prior rate used and the positives the calibration share expects. */
+    priorRate?: number;
+    expectedCalibrationPositives?: number;
 }
 export interface DesignSummary {
     designId: string;
+    allocation: {
+        method: DesignOptions['allocation']['method'];
+        minExpectedPositives?: number;
+        minShare?: number;
+        priorRates?: Record<string, number>;
+    };
+    /** Strata that could not reach minExpectedPositives even when taken whole, and similar notes. */
+    warnings: string[];
     scoringModel: string;
     seed: number;
     /** Frame items removed because their group already had one. */
@@ -44,8 +55,25 @@ export interface DesignOptions {
     bySlice?: boolean;
     allocation: {
         total: number;
-        method: 'proportional' | 'manual';
+        method: 'proportional' | 'manual' | 'expected-positives';
         manual?: Record<string, number>;
+        /**
+         * expected-positives: per stratum name, the positive rate from a prior, independent round -
+         * a rate in (0, 1], or counts { positives, labelled } (estimated as (positives + 0.5) / (labelled + 1),
+         * so a stratum with no positives yet still gets a finite, generous size).
+         */
+        prior?: Record<string, number | {
+            positives: number;
+            labelled: number;
+        }>;
+        /** expected-positives: positives each stratum's calibration and test shares should expect (default 10). */
+        minExpectedPositives?: number;
+        /**
+         * expected-positives: only strata estimated to hold at least this share of all positives get
+         * the floor (default 0.02). A stratum nearly empty of positives can't move the miss rate much,
+         * and proving it empty would cost most of the stratum.
+         */
+        minShare?: number;
     };
     /** Default 30. */
     minPerStratum?: number;

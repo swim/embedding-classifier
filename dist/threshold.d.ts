@@ -42,6 +42,11 @@ export type HeadPolicy = {
     allowHeuristicFallback?: boolean;
     /** design mode: the bound behind the guarantee (default 'exact'; see solvers' designRiskThreshold). */
     designMethod?: 'exact' | 'linearised' | 'bootstrap';
+    /**
+     * design mode, linearised / bootstrap: infeasible when a sampled calibration stratum holds fewer
+     * positives than this (default 5; 0 turns the guard off). See designSample's expected-positives allocation.
+     */
+    designMinStratumPositives?: number;
     /** Conformal modes: the guarantee fails with probability at most delta (default 0.05), split across recall and every false-alarm budget. */
     delta?: number;
     /** Highest share of calibration negatives allowed to fire (default 1: no cap). */

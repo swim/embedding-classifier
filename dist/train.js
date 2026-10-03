@@ -197,8 +197,9 @@ export function trainHeads(input) {
             if (!calDesign)
                 throw new Error(`${name}: mode 'design' needs sampled calibration records (records)`);
             const designMethod = policy.designMethod ?? 'exact';
-            const res = designRiskThreshold({ ...calDesign, y: yCal, scores: pCal, alpha: 1 - policy.targetRecall, delta, method: designMethod, seed });
+            const res = designRiskThreshold({ ...calDesign, y: yCal, scores: pCal, alpha: 1 - policy.targetRecall, delta, method: designMethod, seed, ...(policy.designMinStratumPositives !== undefined ? { minStratumPositives: policy.designMinStratumPositives } : {}) });
             const fails = [];
+            result.warnings.push(...(res.warnings ?? []).map((w) => `${name}: design: ${w}`));
             if (res.feasible) {
                 threshold = res.threshold;
                 guarantee = { mode, kind: res.guarantee, alpha: 1 - policy.targetRecall, delta, method: designMethod };

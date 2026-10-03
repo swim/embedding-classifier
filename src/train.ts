@@ -106,7 +106,9 @@ export interface TrainInput<H extends string> {
   /**
    * Ordinary, mostly-negative traffic (e.g. everyday messages): each listed head's threshold is
    * raised until it fires on at most maxRate of it - BEFORE test evaluation, so the gates judge
-   * the threshold that will ship.
+   * the threshold that will ship. Real traffic holds positives at production prevalence, so
+   * maxRate must sit above prevalence × the recall you want (8% for a 4% head), or the budget
+   * caps recall rather than false alarms.
    */
   background?: {
     X: ReadonlyArray<ArrayLike<number>>;
@@ -126,6 +128,12 @@ export interface TrainInput<H extends string> {
   provenance?: Omit<ProvenanceOptions, 'embeddings' | 'safetyCritical'>;
   /** P6 caps; ruleMatches is required when generated hard negatives are present. */
   caps?: WeightCaps;
+  /**
+   * Embeddings for the provenance near-duplicate check (P5), aligned with X then background.X
+   * (default: X and background.X). Pass them when X holds other features - stacked scores, or
+   * embeddings with extra columns - since cosine similarity between those isn't about the text.
+   */
+  provenanceEmbeddings?: { X: ReadonlyArray<ArrayLike<number>>; background?: ReadonlyArray<ArrayLike<number>> };
   /** Seed for design bootstraps (default 0). */
   seed?: number;
   log?: (line: string) => void;
@@ -159,6 +167,11 @@ export interface TrainResult<H extends string> {
 
 function checkLength(name: string, values: { length: number } | undefined, n: number): void {
   if (values !== undefined && values.length !== n) throw new Error(`${name} has ${values.length} entries but X has ${n}`);
+}
+
+function checkedLength<T>(name: string, values: readonly T[], n: number): readonly T[] {
+  checkLength(name, values, n);
+  return values;
 }
 
 function indicesBySplit(split: readonly Split[], y: ReadonlyArray<0 | 1 | null>): Record<Split, number[]> {
@@ -199,7 +212,9 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
       throw new Error('with records, background.records is required so the budget traffic can be checked (P2, P3)');
     }
     const safety = input.heads.filter((h) => h.safetyCritical).map((h) => h.name as string);
-    const checked = validateProvenance([...records, ...bgRecords], { ...input.provenance, embeddings: [...X, ...(background?.X ?? [])], safetyCritical: safety });
+    const checked = validateProvenance([...records, ...bgRecords], { ...input.provenance, embeddings: input.provenanceEmbeddings
+      ? [...checkedLength('provenanceEmbeddings.X', input.provenanceEmbeddings.X, X.length), ...(input.provenanceEmbeddings.background ?? background?.X ?? [])]
+      : [...X, ...(background?.X ?? [])], safetyCritical: safety });
     const droppedIds = new Set(checked.dropped.map((d) => d.id));
     records.forEach((r, i) => { if (droppedIds.has(r.id)) excluded.add(i); });
     result.warnings.push(...checked.warnings.map((w) => `provenance: ${w}`));
@@ -382,10 +397,17 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
       const designMethod = policy.designMethod ?? 'linearised';
       // Candidates fixed before calibration: training-split logits (evenly spaced ranks from the 30th
       // highest down), mapped through the calibrator so the bound is computed on the firing rule that ships.
-      const trainZ = idx.train.map((i) => decisionFunction(model, X[i])).sort((a, b) => b - a);
-      const start = Math.min(29, trainZ.length - 1);
-      const ranks = Array.from({ length: 150 }, (_, k) => start + Math.floor((k * (trainZ.length - 1 - start)) / 149));
-      const candidates = [...new Set(ranks.map((r) => calibrate(calibration, trainZ[r])))].sort((a, b) => b - a);
+      // Candidate scores fixed before calibration: background traffic when there is some (independent of
+      // calibration, natural prevalence), else training scores - an enriched training set fires far more
+      // often at the top than calibration traffic does. The r-th highest of n reference scores is expected
+      // to be exceeded by ~r · n_cal / n calibration examples: start where that is about designMinFired.
+      const minFired = policy.designMinFired ?? 20;
+      const reference = background && background.X.length
+        ? background.X.map((x) => score(x)).sort((a, b) => b - a)
+        : idx.train.map((i) => calibrate(calibration, decisionFunction(model, X[i]))).sort((a, b) => b - a);
+      const start = Math.min(reference.length - 1, Math.ceil((minFired * reference.length) / Math.max(1, idx.calibration.length)) - 1);
+      const ranks = Array.from({ length: 150 }, (_, k) => start + Math.floor((k * (reference.length - 1 - start)) / 149));
+      const candidates = [...new Set(ranks.map((r) => reference[r]))].sort((a, b) => b - a);
       const res = designPrecisionThreshold({ ...calDesign, y: yCal, scores: pCal, candidates, targetPrecision: policy.targetPrecision, delta, method: designMethod });
       const alpha = 1 - policy.targetPrecision;
       if (res.feasible) {
@@ -412,7 +434,7 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
       if (policy.kind === 'recall') guarantee = { mode: 'heuristic', kind: 'none', alpha: 1 - policy.targetRecall };
     }
     if (records && !result.design!.heads[name]) result.design!.heads[name] = { calibration: 'design-weighted', threshold: mode, evaluation: 'design-linearised' };
-    if (policy.kind === 'precision' && !pCal.some((p) => p >= threshold)) {
+    if (policy.kind === 'precision' && policy.mode !== 'design' && !pCal.some((p) => p >= threshold)) {
       result.warnings.push(`${name}: no calibration example reaches the target precision ${threshold} - the head is unlikely ever to fire`);
     }
     const reviewFloor = reviewEpsilon === undefined ? threshold * reviewRatio : Math.min(threshold, conformalLowerThreshold(positives, reviewEpsilon) ?? 0);

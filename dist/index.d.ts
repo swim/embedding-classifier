@@ -14,7 +14,7 @@ export type { ArtifactRole, ServeMode } from './lifecycle.ts';
 export { reportMarkdown } from './report.ts';
 export { conformalThreshold, groupScores, THRESHOLD_MODES } from './conformal.ts';
 export type { ConformalSelection, FalseAlarmConstraint, Guarantee, GuaranteeKind, Sufficiency, ThresholdMode } from './conformal.ts';
-export { applyReviews, designOf, designSample, labelQueue, stableId } from './design.ts';
+export { applyReviews, designOf, designSample, labelQueue, requiredSampleSize, stableId } from './design.ts';
 export type { DesignOptions, DesignStratum, DesignSummary, FrameItem, Mechanism, QueueItem, QueueKey } from './design.ts';
 export { capTrainingWeights, isReal, ProvenanceError, validateProvenance } from './records.ts';
 export type { BackgroundUse, ExampleRecord, ProvenanceCode, ProvenanceOptions, ProvenanceResult, Role, Source, WeightCaps, WeightCapSummary } from './records.ts';

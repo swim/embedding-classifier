@@ -11,6 +11,11 @@ export function gateHead(policy: HeadPolicy, ev: HeadEvaluation, options: { maxE
   const { maxEce = 0.05, calibrationAlpha } = options;
   const failures: string[] = [];
   const warnings: string[] = [];
+  if (ev.threshold > 1) {
+    // A threshold above every probability: the head was disabled because no threshold met its policy.
+    failures.push('disabled: no threshold met its policy, so the head never fires');
+    return { failures, warnings };
+  }
   if (policy.kind === 'recall') {
     const minPositives = policy.minPositives ?? 0;
     // A stratified test sample counts its Kish effective positives, not rows.
@@ -56,7 +61,9 @@ export function gateHead(policy: HeadPolicy, ev: HeadEvaluation, options: { maxE
     }
   }
   if (!(ev.ece_prevalence_weighted <= maxEce)) failures.push(`ECE ${ev.ece_prevalence_weighted.toFixed(3)} > ${maxEce}`);
-  if (calibrationAlpha !== undefined && ev.calibration_test && ev.calibration_test.p_value <= calibrationAlpha) {
+  if (calibrationAlpha !== undefined && ev.calibration_test && ev.calibration_test.stable === false) {
+    warnings.push(`calibration test not applied: the recalibration fit is unstable (intercept ${ev.calibration_test.intercept.toFixed(1)}, slope ${ev.calibration_test.slope.toFixed(1)}) - the scores separate the classes almost perfectly`);
+  } else if (calibrationAlpha !== undefined && ev.calibration_test && ev.calibration_test.p_value <= calibrationAlpha) {
     const c = ev.calibration_test;
     failures.push(`probabilities are miscalibrated (Cox test p = ${c.p_value.toExponential(2)} <= ${calibrationAlpha}: intercept ${c.intercept.toFixed(3)}, slope ${c.slope.toFixed(3)}; calibrated is 0 and 1)`);
   }

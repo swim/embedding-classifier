@@ -4,7 +4,7 @@
  * is supplied, e.g. existing rules) what the classifier adds on top of it, and exact certified
  * bounds for the shipped threshold whatever chose it.
  */
-import { clopperPearsonUpper, coxTest, ece, kishEffectiveN, normalQuantile, stratifiedBootstrap, stratifiedRatio, weightedQuantile, wilson, type ReliabilityRow } from '@liquidau/solvers';
+import { clopperPearsonLower, clopperPearsonUpper, coxTest, ece, kishEffectiveN, normalQuantile, stratifiedBootstrap, stratifiedRatio, weightedQuantile, wilson, type ReliabilityRow } from '@liquidau/solvers';
 
 import type { Guarantee, Sufficiency } from './conformal.ts';
 
@@ -49,6 +49,9 @@ export interface DesignEvaluation {
   slices: Record<string, DesignEstimate>;
   /** Kish effective number of positives - what the gates' minimums count. */
   effective_positives: number;
+  /** With a baseline: baseline OR classifier, design-weighted. */
+  combined_recall?: DesignEstimate;
+  combined_false_alarm_rate?: DesignEstimate;
   replicates: number;
 }
 
@@ -91,7 +94,11 @@ export interface HeadEvaluation {
    * Cox's recalibration test on the test split (weights as for ECE): y ~ a + b·logit(p), H0 a = 0, b = 1.
    * Unlike ECE it has a stated error rate and stays sensitive for rare classes.
    */
-  calibration_test?: { intercept: number; slope: number; lr: number; p_value: number };
+  calibration_test?: {
+    intercept: number; slope: number; lr: number; p_value: number;
+    /** False under separation (every positive scores above every negative), or when the fit didn't converge or ran off (|a| or |b| > 10): the p-value then means nothing. */
+    stable: boolean;
+  };
   /** Recall heads: what the shipped threshold guarantees from calibration, and why. */
   guarantee?: Guarantee;
   sufficiency?: Sufficiency;
@@ -122,17 +129,27 @@ export interface EvaluateInput {
   design?: { inclusionProbs: readonly number[]; strata: readonly string[]; stratumSizes: Readonly<Record<string, number>>; replicates?: number; seed?: number };
 }
 
-const clopperPearsonLower = (k: number, n: number, confidence: number) => 1 - clopperPearsonUpper(n - k, n, confidence);
 
-function designEvaluation(p: readonly number[], y: readonly number[], fired: readonly boolean[], design: NonNullable<EvaluateInput['design']>, slices: Readonly<Record<string, readonly string[]>>): DesignEvaluation {
+/** Exact one-sided bounds for a proportion `p` at a (Kish) effective sample size. */
+function exactAtEffective(p: number, nEff: number, confidence: number): [number, number] {
+  const n = Math.max(1, Math.round(nEff));
+  const k = Math.min(n, Math.max(0, Math.round(p * n)));
+  return [clopperPearsonLower(k, n, confidence), clopperPearsonUpper(k, n, confidence)];
+}
+
+function designEvaluation(p: readonly number[], y: readonly number[], fired: readonly boolean[], design: NonNullable<EvaluateInput['design']>, slices: Readonly<Record<string, readonly string[]>>, baseline?: readonly boolean[]): DesignEvaluation {
   const { replicates = 2000, seed = 0 } = design;
   const reps = replicates > 0 ? stratifiedBootstrap({ inclusionProbs: design.inclusionProbs, strata: design.strata, replicates, seed }) : null;
   const est = (num: number[], den: number[]): DesignEstimate | null => {
     if (!den.some((d) => d !== 0)) return null;
     const r = stratifiedRatio({ ...design, num, den });
+    const effective = kishEffectiveN(den.flatMap((d, i) => (d ? [d / design.inclusionProbs[i]] : [])));
+    // The linearised interval collapses at 0 and 1 (no observed variance): widen it to the exact
+    // Clopper-Pearson interval at the Kish effective size, as Korn and Graubard do.
+    const [lo, hi] = exactAtEffective(r.estimate, effective, 0.975);
     const out: DesignEstimate = {
-      estimate: r.estimate, se: r.se, ci95: [Math.max(0, r.estimate - 1.96 * r.se), Math.min(1, r.estimate + 1.96 * r.se)],
-      effective_n: kishEffectiveN(den.flatMap((d, i) => (d ? [d / design.inclusionProbs[i]] : []))),
+      estimate: r.estimate, se: r.se, effective_n: effective,
+      ci95: [Math.max(0, Math.min(r.estimate - 1.96 * r.se, lo)), Math.min(1, Math.max(r.estimate + 1.96 * r.se, hi))],
     };
     if (reps) {
       const rs = reps.flatMap((wb) => {
@@ -163,6 +180,10 @@ function designEvaluation(p: readonly number[], y: readonly number[], fired: rea
     slices: sliceEstimates,
     effective_positives: kishEffectiveN(y.flatMap((v, i) => (v === 1 ? [1 / design.inclusionProbs[i]] : []))),
     replicates,
+    ...(baseline ? {
+      combined_recall: est(y.map((v, i) => v * Number(baseline[i] || fired[i])), [...y])!,
+      combined_false_alarm_rate: est(y.map((v, i) => (1 - v) * Number(baseline[i] || fired[i])), y.map((v) => 1 - v))!,
+    } : {}),
   };
 }
 
@@ -247,23 +268,33 @@ export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline
   if (y.some((v) => v === 1) && y.some((v) => v === 0)) {
     const clip = (v: number) => Math.min(1 - 1e-12, Math.max(1e-12, v));
     const c = coxTest(p.map(clip), y, w);
-    result.calibration_test = { intercept: c.intercept, slope: c.slope, lr: c.lr, p_value: c.pValue };
+    const converged = (c as { converged?: boolean }).converged !== false;
+    // Complete separation: every positive scores above every negative, so the maximum-likelihood slope is infinite.
+    let minPos = Infinity, maxNeg = -Infinity;
+    p.forEach((v, i) => { if (y[i] === 1) minPos = Math.min(minPos, v); else if (y[i] === 0) maxNeg = Math.max(maxNeg, v); });
+    const separated = minPos > maxNeg;
+    result.calibration_test = { intercept: c.intercept, slope: c.slope, lr: c.lr, p_value: c.pValue, stable: converged && !separated && Math.abs(c.intercept) <= 10 && Math.abs(c.slope) <= 10 };
   }
   if (design) {
-    const d = designEvaluation(p, y, fired, design, slices);
+    const d = designEvaluation(p, y, fired, design, slices, baseline);
     const z = normalQuantile(1 - delta / 2);
     result.design = d;
     result.recall = d.recall.estimate;
     result.recall_ci95 = d.recall.ci95;
     result.false_alarm_rate = d.false_alarm_rate.estimate;
     result.precision_prevalence_weighted = d.precision?.estimate ?? NaN;
+    if (d.combined_recall && d.combined_false_alarm_rate) {
+      result.combined_recall = d.combined_recall.estimate;
+      result.combined_recall_ci95 = d.combined_recall.ci95;
+      result.combined_false_alarm_rate = d.combined_false_alarm_rate.estimate;
+    }
     result.certified = {
       ...certified,
       method: 'design-linearised',
-      recall_lower: Math.max(0, d.recall.estimate - z * d.recall.se),
-      recall_upper: Math.min(1, d.recall.estimate + z * d.recall.se),
-      false_alarm_upper: Math.min(1, d.false_alarm_rate.estimate + z * d.false_alarm_rate.se),
-      precision_lower: d.precision ? Math.max(0, d.precision.estimate - z * d.precision.se) : undefined,
+      recall_lower: Math.max(0, Math.min(d.recall.estimate - z * d.recall.se, exactAtEffective(d.recall.estimate, d.recall.effective_n ?? 1, 1 - delta / 2)[0])),
+      recall_upper: Math.min(1, Math.max(d.recall.estimate + z * d.recall.se, exactAtEffective(d.recall.estimate, d.recall.effective_n ?? 1, 1 - delta / 2)[1])),
+      false_alarm_upper: Math.min(1, Math.max(d.false_alarm_rate.estimate + z * d.false_alarm_rate.se, exactAtEffective(d.false_alarm_rate.estimate, d.false_alarm_rate.effective_n ?? 1, 1 - delta / 2)[1])),
+      precision_lower: d.precision ? Math.max(0, Math.min(d.precision.estimate - z * d.precision.se, exactAtEffective(d.precision.estimate, d.precision.effective_n ?? 1, 1 - delta / 2)[0])) : undefined,
     };
   } else certified.method = 'exact';
   return result;

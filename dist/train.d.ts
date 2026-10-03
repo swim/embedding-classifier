@@ -87,7 +87,9 @@ export interface TrainInput<H extends string> {
     /**
      * Ordinary, mostly-negative traffic (e.g. everyday messages): each listed head's threshold is
      * raised until it fires on at most maxRate of it - BEFORE test evaluation, so the gates judge
-     * the threshold that will ship.
+     * the threshold that will ship. Real traffic holds positives at production prevalence, so
+     * maxRate must sit above prevalence × the recall you want (8% for a 4% head), or the budget
+     * caps recall rather than false alarms.
      */
     background?: {
         X: ReadonlyArray<ArrayLike<number>>;
@@ -107,6 +109,15 @@ export interface TrainInput<H extends string> {
     provenance?: Omit<ProvenanceOptions, 'embeddings' | 'safetyCritical'>;
     /** P6 caps; ruleMatches is required when generated hard negatives are present. */
     caps?: WeightCaps;
+    /**
+     * Embeddings for the provenance near-duplicate check (P5), aligned with X then background.X
+     * (default: X and background.X). Pass them when X holds other features - stacked scores, or
+     * embeddings with extra columns - since cosine similarity between those isn't about the text.
+     */
+    provenanceEmbeddings?: {
+        X: ReadonlyArray<ArrayLike<number>>;
+        background?: ReadonlyArray<ArrayLike<number>>;
+    };
     /** Seed for design bootstraps (default 0). */
     seed?: number;
     log?: (line: string) => void;

@@ -445,3 +445,96 @@ test('calibration gate: Cox test fails overconfident rare-class probabilities th
   assert.ok(gateHead(policy, overconfident, { calibrationAlpha: 0.01 }).failures.some((f) => /miscalibrated \(Cox test/.test(f)));
   assert.ok(!gateHead(policy, calibrated, { calibrationAlpha: 0.01 }).failures.some((f) => /miscalibrated/.test(f)));
 });
+
+test('sizing for several heads, without parsing errors: requiredSampleSize and priors', async () => {
+  const { requiredSampleSize } = await import('../src/index.ts');
+  const frameA = rarePositiveFrame(30000, 11);
+  const prior = { 'no_rule|band0': { positives: 54, labelled: 420 }, 'no_rule|band1': { positives: 20, labelled: 400 }, 'no_rule|band2': { positives: 15, labelled: 1180 } };
+  const rarer = { 'no_rule|band0': { positives: 20, labelled: 420 }, 'no_rule|band1': { positives: 4, labelled: 400 }, 'no_rule|band2': { positives: 9, labelled: 1180 } };
+  const base = { frame: frameA, scoreBands: [0.79, 0.59], scoringModel: 'm' };
+  const one = requiredSampleSize({ ...base, allocation: { prior } });
+  const both = requiredSampleSize({ ...base, allocation: { priors: { a: prior, b: rarer } } });
+  assert.ok(one > 0 && both > one, `${one} vs ${both}: the rarer head needs more`);
+  assert.equal(both, requiredSampleSize({ ...base, allocation: { prior: rarer } }), 'the total satisfies every head');
+  const d = designSample({ ...base, seed: 1, allocation: { total: both, method: 'expected-positives', priors: { a: prior, b: rarer } } });
+  assert.equal(d.design.allocation.requiredTotal, both);
+  assert.deepEqual(Object.keys(d.design.allocation.priorRatesByHead!), ['a', 'b']);
+  assert.throws(() => designSample({ ...base, seed: 1, allocation: { total: both, method: 'expected-positives', prior, priors: { a: prior } } }), /exactly one of prior or priors/);
+  // A stratum with no positives in the prior round doesn't count as material, however few were labelled.
+  const zeroLow = { ...prior, 'no_rule|band2': { positives: 0, labelled: 30 } };
+  const zeroLowMore = { ...prior, 'no_rule|band2': { positives: 0, labelled: 3000 } };
+  assert.equal(requiredSampleSize({ ...base, allocation: { prior: zeroLow } }), requiredSampleSize({ ...base, allocation: { prior: zeroLowMore } }));
+});
+
+test('design intervals do not collapse at 0 or 1, and a disabled head gets one clear failure', async () => {
+  const { evaluateHead, gateHead } = await import('../src/index.ts');
+  const n = 400;
+  const strata = Array.from({ length: n }, (_, i) => (i % 2 ? 'h1' : 'h2'));
+  const y = strata.map((_, i) => (i % 10 === 0 ? 1 : 0));
+  const p = y.map((v) => (v ? 0.9 : 0.1)); // every positive caught
+  const ev = evaluateHead({ p, y, w: p.map(() => 10), threshold: 0.5, design: { inclusionProbs: p.map(() => 0.1), strata, stratumSizes: { h1: 2000, h2: 2000 }, replicates: 0 } });
+  assert.equal(ev.design!.recall.estimate, 1);
+  assert.equal(ev.design!.recall.se, 0);
+  assert.ok(ev.design!.recall.ci95[0] < 0.95, `exact floor at ${ev.design!.recall.effective_n} effective positives: ${ev.design!.recall.ci95}`);
+  assert.ok(ev.certified.recall_lower < 0.95);
+  const disabled = gateHead({ kind: 'precision', targetPrecision: 0.9 }, { ...ev, threshold: 1.0000000000000002 });
+  assert.deepEqual(disabled.failures, ['disabled: no threshold met its policy, so the head never fires']);
+});
+
+test('design precision: the strictest candidate is placed so calibration can fire enough', () => {
+  const sampled = design(7, 3000).records;
+  const { records } = label(sampled);
+  const X = records.map((r) => byId.get(r.id)!.x);
+  const split = records.map((r) => r.role as Split);
+  const y = records.map((r) => r.labels.h as 0 | 1);
+  const run = (designMinFired?: number) => trainHeads({ X, split, records, seed: 1, heads: [{ name: 'h', y, policy: { kind: 'precision', targetPrecision: 0.7, mode: 'design', designMinFired } }] });
+  const r = run();
+  assert.deepEqual(r.failures, [], r.failures.join('; '));
+  assert.equal(r.heads.h!.guarantee!.kind, 'design-approximate');
+});
+
+test('calibration gate: an unstable recalibration fit (near-separation) warns instead of gating', async () => {
+  const { evaluateHead, gateHead } = await import('../src/index.ts');
+  const y = Array.from({ length: 400 }, (_, i) => (i % 20 === 0 ? 1 : 0));
+  const p = y.map((v, i) => (v ? 0.999 - (i % 7) * 1e-4 : 0.001 + (i % 5) * 1e-4)); // the classes never overlap
+  const ev = evaluateHead({ p, y, w: p.map(() => 1), threshold: 0.5 });
+  assert.equal(ev.calibration_test!.stable, false, JSON.stringify(ev.calibration_test));
+  const g = gateHead({ kind: 'precision', targetPrecision: 0.5 }, ev, { calibrationAlpha: 0.01 });
+  assert.ok(!g.failures.some((f) => /miscalibrated/.test(f)));
+  assert.ok(g.warnings.some((w) => /calibration test not applied: the recalibration fit is unstable/.test(w)));
+});
+
+test('combined recall with a baseline is design-weighted on a sampled test set', async () => {
+  const { evaluateHead } = await import('../src/index.ts');
+  // Stratum h1 is sampled at 10x the rate of h2; the baseline only catches h1 positives.
+  const strata = [...Array(200).fill('h1'), ...Array(200).fill('h2')];
+  const y = strata.map((_, i) => (i % 4 === 0 ? 1 : 0));
+  const p = y.map(() => 0.1); // the classifier catches nothing
+  const baseline = strata.map((s, i) => s === 'h1' && y[i] === 1);
+  const ev = evaluateHead({ p, y, w: strata.map((s) => (s === 'h1' ? 1 : 10)), threshold: 0.5, baseline, design: { inclusionProbs: strata.map((s) => (s === 'h1' ? 1 : 0.1)), strata, stratumSizes: { h1: 200, h2: 2000 }, replicates: 0 } });
+  assert.equal(ev.vs_baseline!.caught_by_baseline_only, 50, 'raw counts stay counts');
+  assert.ok(Math.abs(ev.combined_recall! - 50 / 550) < 1e-12, `weighted: 50 of 550 population positives, not 50 of 100 sampled (${ev.combined_recall})`);
+});
+
+test('provenanceEmbeddings: the near-duplicate check uses real embeddings when X holds other features', () => {
+  const sampled = design(7, 3000).records;
+  const { records: labelledRecords } = label(sampled);
+  // Add retrieved training records whose texts are unrelated to any evaluation record.
+  const extra: ExampleRecord[] = frame.filter((f) => !labelledRecords.some((r) => r.group === f.group)).slice(0, 40).map((f) => ({
+    id: f.id, text: f.text, group: f.group, role: 'train', labels: { h: f.truth }, labelledBy: 'human',
+    source: { kind: 'retrieved', seedIds: ['s'], similarity: 0.7, round: 1 },
+  }));
+  const records = [...labelledRecords, ...extra];
+  const embeddings = records.map((r) => byId.get(r.id)!.x);
+  const score = records.map((r) => [byId.get(r.id)!.x[0] + byId.get(r.id)!.x[1]]); // one stacked feature
+  const split = records.map((r) => r.role as Split);
+  const y = records.map((r) => r.labels.h as 0 | 1);
+  const heads = [{ name: 'h', y, policy: { kind: 'recall' as const, targetRecall: 0.8, mode: 'design' as const, designMethod: 'linearised' as const } }];
+  const naive = trainHeads({ X: score, split, records, heads, seed: 1 });
+  assert.ok(naive.provenance!.dropped.length >= 40, `one-column X: cosine is ±1, so ${naive.provenance!.dropped.length} records look like near-duplicates`);
+  const fixed = trainHeads({ X: score, split, records, heads, seed: 1, provenanceEmbeddings: { X: embeddings } });
+  const direct = validateProvenance(records, { embeddings });
+  assert.deepEqual(fixed.provenance!.dropped.map((d) => d.id).sort(), direct.dropped.map((d) => d.id).sort(), 'the same decisions as on the real embeddings');
+  assert.ok(fixed.provenance!.dropped.length < naive.provenance!.dropped.length);
+  assert.throws(() => trainHeads({ X: score, split, records, heads, seed: 1, provenanceEmbeddings: { X: embeddings.slice(1) } }), /provenanceEmbeddings.X has/);
+});

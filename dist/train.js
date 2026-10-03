@@ -27,6 +27,10 @@ function checkLength(name, values, n) {
     if (values !== undefined && values.length !== n)
         throw new Error(`${name} has ${values.length} entries but X has ${n}`);
 }
+function checkedLength(name, values, n) {
+    checkLength(name, values, n);
+    return values;
+}
 function indicesBySplit(split, y) {
     const idx = { train: [], calibration: [], test: [] };
     split.forEach((s, i) => {
@@ -72,7 +76,9 @@ export function trainHeads(input) {
             throw new Error('with records, background.records is required so the budget traffic can be checked (P2, P3)');
         }
         const safety = input.heads.filter((h) => h.safetyCritical).map((h) => h.name);
-        const checked = validateProvenance([...records, ...bgRecords], { ...input.provenance, embeddings: [...X, ...(background?.X ?? [])], safetyCritical: safety });
+        const checked = validateProvenance([...records, ...bgRecords], { ...input.provenance, embeddings: input.provenanceEmbeddings
+                ? [...checkedLength('provenanceEmbeddings.X', input.provenanceEmbeddings.X, X.length), ...(input.provenanceEmbeddings.background ?? background?.X ?? [])]
+                : [...X, ...(background?.X ?? [])], safetyCritical: safety });
         const droppedIds = new Set(checked.dropped.map((d) => d.id));
         records.forEach((r, i) => { if (droppedIds.has(r.id))
             excluded.add(i); });
@@ -272,10 +278,17 @@ export function trainHeads(input) {
             const designMethod = policy.designMethod ?? 'linearised';
             // Candidates fixed before calibration: training-split logits (evenly spaced ranks from the 30th
             // highest down), mapped through the calibrator so the bound is computed on the firing rule that ships.
-            const trainZ = idx.train.map((i) => decisionFunction(model, X[i])).sort((a, b) => b - a);
-            const start = Math.min(29, trainZ.length - 1);
-            const ranks = Array.from({ length: 150 }, (_, k) => start + Math.floor((k * (trainZ.length - 1 - start)) / 149));
-            const candidates = [...new Set(ranks.map((r) => calibrate(calibration, trainZ[r])))].sort((a, b) => b - a);
+            // Candidate scores fixed before calibration: background traffic when there is some (independent of
+            // calibration, natural prevalence), else training scores - an enriched training set fires far more
+            // often at the top than calibration traffic does. The r-th highest of n reference scores is expected
+            // to be exceeded by ~r · n_cal / n calibration examples: start where that is about designMinFired.
+            const minFired = policy.designMinFired ?? 20;
+            const reference = background && background.X.length
+                ? background.X.map((x) => score(x)).sort((a, b) => b - a)
+                : idx.train.map((i) => calibrate(calibration, decisionFunction(model, X[i]))).sort((a, b) => b - a);
+            const start = Math.min(reference.length - 1, Math.ceil((minFired * reference.length) / Math.max(1, idx.calibration.length)) - 1);
+            const ranks = Array.from({ length: 150 }, (_, k) => start + Math.floor((k * (reference.length - 1 - start)) / 149));
+            const candidates = [...new Set(ranks.map((r) => reference[r]))].sort((a, b) => b - a);
             const res = designPrecisionThreshold({ ...calDesign, y: yCal, scores: pCal, candidates, targetPrecision: policy.targetPrecision, delta, method: designMethod });
             const alpha = 1 - policy.targetPrecision;
             if (res.feasible) {
@@ -307,7 +320,7 @@ export function trainHeads(input) {
         }
         if (records && !result.design.heads[name])
             result.design.heads[name] = { calibration: 'design-weighted', threshold: mode, evaluation: 'design-linearised' };
-        if (policy.kind === 'precision' && !pCal.some((p) => p >= threshold)) {
+        if (policy.kind === 'precision' && policy.mode !== 'design' && !pCal.some((p) => p >= threshold)) {
             result.warnings.push(`${name}: no calibration example reaches the target precision ${threshold} - the head is unlikely ever to fire`);
         }
         const reviewFloor = reviewEpsilon === undefined ? threshold * reviewRatio : Math.min(threshold, conformalLowerThreshold(positives, reviewEpsilon) ?? 0);

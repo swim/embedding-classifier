@@ -25,13 +25,21 @@ export function reportMarkdown(artifact, options = {}) {
         const spec = artifact.heads[head];
         if (!spec || !ev)
             continue;
-        lines.push('', `## ${head}`, '', `threshold ${f4(spec.threshold)} · review floor ${f4(spec.review_floor)} · calibration ${spec.calibration?.method ?? 'n/a'}`, '', '| metric | value |', '|---|---|', `| test positives / n | ${ev.positives ?? 'n/a'} / ${ev.n ?? 'n/a'} (from ${ev.positive_groups ?? 'n/a'} distinct group(s)) |`, `| recall (95% CI) | ${f3(ev.recall)} (${ci(ev.recall_ci95)}) |`, `| false-alarm rate | ${f3(ev.false_alarm_rate)} |`, `| precision (prevalence-weighted) | ${f3(ev.precision_prevalence_weighted)} |`, `| ECE (prevalence-weighted) | ${f4(ev.ece_prevalence_weighted)} |`, ...(ev.calibration_test ? [`| calibration test (Cox): intercept / slope, p | ${f3(ev.calibration_test.intercept)} / ${f3(ev.calibration_test.slope)}, p = ${typeof ev.calibration_test.p_value === 'number' ? ev.calibration_test.p_value.toExponential(2) : 'n/a'} |`] : []));
+        lines.push('', `## ${head}`, '', `threshold ${f4(spec.threshold)} · review floor ${f4(spec.review_floor)} · calibration ${spec.calibration?.method ?? 'n/a'}`, '', '| metric | value |', '|---|---|', `| test positives / n | ${ev.positives ?? 'n/a'} / ${ev.n ?? 'n/a'} (from ${ev.positive_groups ?? 'n/a'} distinct group(s)) |`, `| recall (95% CI) | ${f3(ev.recall)} (${ci(ev.recall_ci95)}) |`, `| false-alarm rate | ${f3(ev.false_alarm_rate)} |`, `| precision (prevalence-weighted) | ${f3(ev.precision_prevalence_weighted)} |`, `| ECE (prevalence-weighted) | ${f4(ev.ece_prevalence_weighted)} |`, ...(ev.calibration_test ? [`| calibration test (Cox): intercept / slope, p | ${ev.calibration_test.stable === false ? 'unstable (near-separation)' : `${f3(ev.calibration_test.intercept)} / ${f3(ev.calibration_test.slope)}, p = ${typeof ev.calibration_test.p_value === 'number' ? ev.calibration_test.p_value.toExponential(2) : 'n/a'}`} |`] : []));
+        if (ev.vs_baseline) {
+            lines.push(`| **recall with the ${baselineName} (${baselineName} OR classifier)** | **${f3(ev.combined_recall)} (${ci(ev.combined_recall_ci95)})** |`, `| false-alarm rate with the ${baselineName} | ${f3(ev.combined_false_alarm_rate)} |`);
+        }
         const c = ev.certified;
         if (c) {
-            lines.push(`| certified recall ≥ (test, exact) | ${f3(c.recall_lower)} over ${c.positive_groups} positive group(s) |`, `| certified false-alarm rate ≤ (test, exact) | ${f4(c.false_alarm_upper)} over ${c.negative_groups} negative group(s) |`, ...(c.precision_lower !== undefined ? [`| certified precision ≥ (at production prevalence) | ${f3(c.precision_lower)} |`] : []), ...(ev.background_rate_upper !== undefined ? [`| certified background rate ≤ | ${f4(ev.background_rate_upper)} |`] : []));
+            const how = c.method === 'design-linearised' ? 'test, design-based' : 'test, exact';
+            lines.push(`| certified recall ≥ (${how}) | ${f3(c.recall_lower)} over ${c.positive_groups} positive group(s) |`, `| certified false-alarm rate ≤ (${how}) | ${f4(c.false_alarm_upper)} over ${c.negative_groups} negative group(s) |`, ...(c.precision_lower !== undefined ? [`| certified precision ≥ (at production prevalence) | ${f3(c.precision_lower)} |`] : []), ...(ev.background_rate_upper !== undefined ? [`| certified background rate ≤ | ${f4(ev.background_rate_upper)} |`] : []));
         }
         if (c)
-            lines.push('', `Certified bounds hold together with probability ${f3(1 - c.delta)}, whatever chose the threshold.`);
+            lines.push('', c.method === 'design-linearised'
+                ? `Certified bounds are design-based (approximate), each at ${f3(1 - c.delta / 2)}; recall and false alarms together at ${f3(1 - c.delta)}.`
+                : `Certified bounds hold together with probability ${f3(1 - c.delta)}, whatever chose the threshold.`);
+        if (ev.vs_baseline)
+            lines.push('', `vs ${baselineName} (test positives, unweighted counts): ` + Object.entries(ev.vs_baseline).map(([k, v]) => `${k} ${v}`).join(', '));
         const g = ev.guarantee;
         if (g) {
             const metric = g.metric ?? 'recall';
@@ -55,9 +63,6 @@ export function reportMarkdown(artifact, options = {}) {
         }
         if (spec.review_epsilon !== undefined)
             lines.push('', `Review floor is conformal: at most ${spec.review_epsilon} of positives score below it, in expectation.`);
-        if (ev.vs_baseline) {
-            lines.push(`| **recall with the ${baselineName} (${baselineName} OR classifier)** | **${f3(ev.combined_recall)} (${ci(ev.combined_recall_ci95)})** |`, `| false-alarm rate with the ${baselineName} | ${f3(ev.combined_false_alarm_rate)} |`, '', `vs ${baselineName} (test positives): ` + Object.entries(ev.vs_baseline).map(([k, v]) => `${k} ${v}`).join(', '));
-        }
         const weak = (artifact.training?.weak_labels ?? {})[head];
         if (weak) {
             lines.push('', `Weak positives (train only): ${weak.count ?? 'n/a'}, weight ${f3(weak.weight)} beside ${weak.gold_train_positives ?? 'n/a'} gold ` +

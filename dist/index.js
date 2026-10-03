@@ -7,7 +7,7 @@ export { assertRoundTrip, SPLITS, trainHeads } from "./train.js";
 export { loadOrder, publishPlan, refuseToServe } from "./lifecycle.js";
 export { reportMarkdown } from "./report.js";
 export { conformalThreshold, groupScores, THRESHOLD_MODES } from "./conformal.js";
-export { applyReviews, designOf, designSample, labelQueue, stableId } from "./design.js";
+export { applyReviews, designOf, designSample, labelQueue, requiredSampleSize, stableId } from "./design.js";
 export { capTrainingWeights, isReal, ProvenanceError, validateProvenance } from "./records.js";
 export { mmrSelect, retrieveFromSeeds, seedStats } from "./retrieval.js";
 export { realHardNegatives, selectForReview, verifyBatch } from "./hardnegatives.js";

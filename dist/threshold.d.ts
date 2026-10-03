@@ -85,6 +85,14 @@ export type HeadPolicy = {
     delta?: number;
     /** design mode: 'linearised' (default; approximate) or 'exact' (valid but rarely feasible: it must allow for unseen false positives in every stratum). */
     designMethod?: 'exact' | 'linearised';
+    /**
+     * design mode: the strictest candidate is placed where the calibration set can be expected to
+     * fire about this often (default 20), judged from background traffic when there is some (it is
+     * independent of calibration and has natural prevalence), else from training scores and split
+     * sizes - fixed before calibration either way. Too few firings make the first test fail and stop
+     * the scan: with 6 firings, all correct, the exact lower bound is only 0.61.
+     */
+    designMinFired?: number;
     /** Gate: minimum test examples the head must fire on for its precision to mean anything (default none; warns below 30). */
     minFired?: number;
 };

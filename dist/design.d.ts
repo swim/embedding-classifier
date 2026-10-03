@@ -38,6 +38,10 @@ export interface DesignSummary {
         minExpectedPositives?: number;
         minShare?: number;
         priorRates?: Record<string, number>;
+        /** priors: rates per head, then per stratum. */
+        priorRatesByHead?: Record<string, Record<string, number>>;
+        /** expected-positives: the smallest total that meets minExpectedPositives (see requiredSampleSize). */
+        requiredTotal?: number;
     };
     /** Strata that could not reach minExpectedPositives even when taken whole, and similar notes. */
     warnings: string[];
@@ -78,6 +82,11 @@ export interface DesignOptions {
             positives: number;
             labelled: number;
         }>;
+        /** expected-positives for several heads: per head, a prior as above; the total must satisfy every head. */
+        priors?: Record<string, Record<string, number | {
+            positives: number;
+            labelled: number;
+        }>>;
         /** expected-positives: positives each stratum's calibration and test shares should expect (default 10). */
         minExpectedPositives?: number;
         /**
@@ -89,7 +98,11 @@ export interface DesignOptions {
     };
     /** Default 30. */
     minPerStratum?: number;
-    /** Default 0.5 / 0.25 / 0.25. */
+    /**
+     * Default 0.5 / 0.25 / 0.25. When most training data comes from elsewhere (an enriched historical
+     * set, retrieval), give calibration and test more, e.g. 0.2 / 0.4 / 0.4: they are what guarantees
+     * and estimates rest on, and every expected-positives requirement scales with their share.
+     */
     roleSplit?: {
         train: number;
         calibration: number;
@@ -103,7 +116,16 @@ export declare function designSample(options: DesignOptions): {
     designId: string;
     records: ExampleRecord[];
     design: DesignSummary;
+    /** Every frame item's stratum (after deduplication and merging), keyed as designOf keys strata: `${designId}/${name}`. */
+    stratumOf: Record<string, string>;
 };
+/**
+ * The smallest `allocation.total` an expected-positives design needs: stratifies the frame exactly
+ * as designSample would (including merges) and sizes it, without drawing anything you'd use.
+ */
+export declare function requiredSampleSize(options: Omit<DesignOptions, 'allocation' | 'seed'> & {
+    allocation: Omit<DesignOptions['allocation'], 'total' | 'method'>;
+}): number;
 /**
  * The stratified design of a set of sampled records (one role, one head's labelled subset): for
  * solvers' estimators. Inclusion probabilities are recomputed as n_labelled / N_h, so items that

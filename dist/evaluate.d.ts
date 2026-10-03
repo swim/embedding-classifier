@@ -45,6 +45,9 @@ export interface DesignEvaluation {
     slices: Record<string, DesignEstimate>;
     /** Kish effective number of positives - what the gates' minimums count. */
     effective_positives: number;
+    /** With a baseline: baseline OR classifier, design-weighted. */
+    combined_recall?: DesignEstimate;
+    combined_false_alarm_rate?: DesignEstimate;
     replicates: number;
 }
 export interface BaselineComparison {
@@ -94,6 +97,8 @@ export interface HeadEvaluation {
         slope: number;
         lr: number;
         p_value: number;
+        /** False under separation (every positive scores above every negative), or when the fit didn't converge or ran off (|a| or |b| > 10): the p-value then means nothing. */
+        stable: boolean;
     };
     /** Recall heads: what the shipped threshold guarantees from calibration, and why. */
     guarantee?: Guarantee;

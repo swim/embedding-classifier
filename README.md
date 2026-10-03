@@ -1,89 +1,82 @@
 # @liquidau/embedding-classifier
 
-Calibrated, gated, multi-head classifiers on top of text embeddings: train in Node, ship a small
-JSON artifact, and score it at runtime with the same code that evaluated it.
-
-It is built for decisions where **you must know how often the model is wrong before letting it
-act**, such as routing, prioritisation, moderation or escalation. Each label gets its own head: a logistic
-regression on the embedding, calibrated to the label's production prevalence. Its threshold comes
-from an explicit recall or precision policy, and it must pass release gates before an artifact may
-be enforced.
-
-Built on [`@liquidau/solvers`](https://www.npmjs.com/package/@liquidau/solvers), which is verified against scikit-learn.
-
-## Pipeline
+Per-label classifiers on text embeddings, with thresholds you choose by the error you can accept,
+release gates, and a small JSON artifact for runtime.
 
 ```
-embeddings ─► trainHeads ─────────────────────────────► ClassifierArtifact (JSON)
-              train split:       fitLogistic (class-balanced, L2)        │
-              calibration split: Platt | isotonic @ prevalence           │  validateArtifact
-                                 pickThreshold(policy)                   ▼
-              test split:        evaluateHead + gateHead      scoreEmbedding ─► decide(policy)
+labelled data (designSample, labelQueue, retrieveFromSeeds)
+        │
+        ▼
+trainHeads ── train ───────► logistic head per label
+           ── calibration ─► calibrate ─► threshold (mode)
+           ── test ────────► evaluateHead ─► gateHead
+        │
+        ▼
+artifact.json ─► validateArtifact ─► scoreEmbedding ─► decide ─► your action
+                                                     └─► monitorWindow (drift)
 ```
 
-| Export | What |
-|---|---|
-| `trainHeads` | Fit, calibrate, threshold, evaluate and gate every head. Pure: you supply the embeddings, a split per example, and a binary target per head (`null` leaves an example out of a head) |
-| `HeadPolicy` / `pickThreshold` | `recall`: the threshold reaches `designRecall` on calibration positives, set above the test gate's `targetRecall`, and is capped by a `maxFalseAlarm` budget. `precision`: the threshold is the target precision |
-| `evaluateHead` | Recall with a Wilson 95% CI, false-alarm rate, prevalence-weighted precision and ECE, reliability table, distinct positive groups, recall per slice, and a comparison with an optional **baseline** (e.g. existing rules) including combined recall |
-| `gateHead` | Release gates: minimum positives, recall, CI lower bound, beats the baseline, precision, minimum fired (`minFired`), ECE. Too few distinct groups, or fewer than 30 positives / fired examples with no explicit minimum, produces a warning |
-| `background` (`trainHeads`) / `budgetThreshold` | Raise a head's threshold until it fires on at most a given share of ordinary background traffic, before test evaluation, so the gates judge the shipped threshold. Labelled test sets rarely contain enough ordinary text to show the false alarms that matter |
-| `weak` / `maxWeakShare` (`trainHeads`) | Extra **weak positives** for the train split only (e.g. rule-miner's `weakLabels`), each weighted in [0, 1], total capped at `maxWeakShare` (λ, default 0.5) × the head's gold train positives. An embedding identical to a calibration, test or background row is refused. Class balancing is sample-weighted, so weak positives take λ / (1 + λ) of the positive class's weight instead of adding to it. `weakLabels` in the result (count, weight, cap, per rule, rule-set version and hash) belongs in `artifact.training.weak_labels`, and `reportMarkdown` shows it |
-| `mode` (recall `HeadPolicy`), `conformalThreshold` | How a recall head's threshold is chosen. `heuristic` (default) is the `designRecall` margin and guarantees nothing. `conformal-expected` and `conformal-pac` pick it from order statistics of calibration positives (one per group), so production recall ≥ `targetRecall` in expectation, or with probability 1 − `delta`. `maxFalseAlarm` and any background budget are certified the same way, with δ split across them. If the limits cross, the head fails with the reason. `auto` takes the strongest guarantee the data supports. It falls back for lack of data with an *inconclusive* warning (to no guarantee at all only while `allowHeuristicFallback` is true, the default), and fails rather than drop PAC for the false-alarm budget. `evaluation.sufficiency` says why. Guarantees need each class's calibration examples to be exchangeable with production ones; prevalence may differ |
-| `certified` (`evaluateHead`) | Exact Clopper–Pearson bounds from the test split, valid whatever chose the threshold: recall lower and upper, false-alarm upper, and precision lower at production prevalence. Groups count once. Plus a background-rate upper bound that stays valid when the background set the threshold. Under a conformal guarantee, the recall gate fails only when the test split contradicts it |
-| `reviewEpsilon` (`trainHeads`) | A conformal review floor: at most ε of positives score below it in expectation, so automatic dismissals have a stated miss rate |
-| `ExampleRecord`, `validateProvenance`, `capTrainingWeights` (`records` on `trainHeads`) | Where every example came from. Only probability-sampled, human-labelled real traffic may calibrate or test (P1). Background is unlabelled traffic with one use (P2). A group stays in one role (P3). Retrieved and generated data are training-only (P4); near-duplicates of evaluation records are dropped (P5). Retrieved positives are capped at 50% and generated hard negatives at 30% of a head's training weight, and per rule (P6). Generated records need verification or an accepted batch (P7). Violations throw `ProvenanceError`; overrides are recorded and fail the release gate |
-| `designSample`, `labelQueue`, `applyReviews`, `designOf` | A stratified probability sample of a traffic frame (rule firing × score band × optional slice), split into train, calibration and test before labelling. One blinded labelling queue: reviewers see an id, the text and the heads, nothing else. Inclusion probabilities are recomputed from what was actually labelled; skip rates are reported. Scores in the frame must come from text only. Allocation `expected-positives` keeps proportional shares and throws unless `total` is large enough for every stratum holding ≥ 2% of positives to expect 10 calibration positives, using rates from a prior round. In simulation, over-sampling high-score strata (the usual way to find positives) made design-based recall bounds fail in 57% of feasible runs, while sized proportional allocation held at 3.7% for δ = 5% |
-| `mode: 'design'` (recall `HeadPolicy`), design-based evaluation | With sampled records, calibration is weighted by 1/π, which already reproduces production prevalence, so `prevalence` must not be passed. The `design` mode sets the threshold with solvers' `designRiskThreshold` (`designMethod` `exact` or `linearised`). Test metrics become Horvitz–Thompson estimates with linearised and bootstrap intervals, and the gates count Kish effective positives. Conformal modes refuse unequal inclusion probabilities |
-| `retrieveFromSeeds`, `seedStats` | Real candidates near verified positives (cosine floor, MMR diversity), excluding labelled, reserved and evaluation-near-duplicate items, for labelling as training data. Seeds with a hit rate below 0.1 after 10 labels are retired |
-| `realHardNegatives`, `selectForReview`, `verifyBatch` | Real rule-firing negatives from training data; generated batches accepted when the Wilson lower bound on reviewer agreement is ≥ 0.9 (96/100 passes, 95/100 fails). `publishPlan` refuses to promote an artifact trained on generated data without acceptance evidence |
-| `defineAxes`, `coverageReport`, `checkSliceAxes` | Where real labelled data is thin: per-value and pairwise counts, and the positive groups each observable slice needs for a zero-miss guarantee. Tags are approximate and used only in this report |
-| `mergeSmallStrata` (`designSample`, default on) | Strata too small for 2 calibration and 2 test items are merged before sampling: an adjacent band with the same rule firing and slice first, then across slice, then across rule firing. The design records which cells were merged. Decided from frame counts only, so estimates stay unbiased |
-| `monitorWindow` | Drift checks for a deployed head. Exact binomial tests on the live share at or above the threshold (against the certified background bound) and at or above the review floor (against a reference), in both directions, with Bonferroni across the four tests. In simulation they caught new high-scoring topics and lost firing that a KS test on the whole score distribution missed, with no false alarms in 400 windows. Label meaning can't be monitored without fresh samples |
-| `mode: 'design'` (precision `HeadPolicy`) | A precision threshold with a design-based guarantee from sampled calibration records. Candidates come from training scores, so they're fixed before calibration. In simulation the heuristic precision threshold missed its target in 95% of runs when Platt was misspecified; the design threshold held it |
-| `sliceGate` (recall `HeadPolicy`) | Fails a slice whose recall is demonstrably below target (upper bound below target, Bonferroni across slices), warns when it can't be confirmed or has too few positives. With a slice at 0.80 against a 0.9 target it failed 99.9% of runs, where the overall recall gate failed 29% |
-| `calibration_test`, `calibrationAlpha` | Cox's recalibration test on the test split, always reported; `calibrationAlpha` makes it a gate. At 2% prevalence the ECE > 0.05 gate never fired, even for clearly miscalibrated probabilities. Cox kept a 5% false-rejection rate and caught shifted, overconfident and top-inflated probabilities |
-| `stratumOf` (`designSample`) | Every frame item's stratum, keyed as `designOf` keys strata. Population-level facts (e.g. how often a deterministic rule fires in each stratum) can then sharpen design-based bounds |
-| `requiredSampleSize`, `allocation.priors` | The smallest `expected-positives` total, computed without drawing. Priors for several heads give a total that satisfies every head. A stratum counts as material only if the prior round saw positives in it |
-| `assertRoundTrip` | Serialise, reload and re-score the artifact, so what was evaluated is exactly what will run |
-| `validateArtifact`, `scoreEmbedding`, `calibrate` | Runtime loading and scoring. Small and dependency-light |
-| `decide` / `missingPolicyHeads` | Priority order plus suppression rules, e.g. "the scope heads can't fire while any priority head is in its review band". `decide` throws on a missing or non-finite score. Policy heads the artifact lacks never fire or suppress; check them once at startup with `missingPolicyHeads` |
-| `loadOrder`, `refuseToServe`, `publishPlan` | Artifact lifecycle. A promoted artifact (must pass its gates) is enforced. A shadow candidate (may fail its gates) is only ever scored in shadow mode |
-| `reportMarkdown` | A human-readable report of the gates and every head |
-| `CachedEmbedder`, `truncateText`, `hashEmbedding` (from `/embedder`) | Embedding with a provider-agnostic on-disk cache (Node only): one text per call (`embed`) or batched (`embedBatch`, `batchSize`); atomic saves; optional `dimensions` check. `truncateText` is the surrogate-safe truncation the cache uses - call it at runtime too. Plus a deterministic fake embedding for pipeline tests. `EmbeddingSpec.input_type` records provider input types (e.g. Cohere `classification`) |
+Built on [`@liquidau/solvers`](https://www.npmjs.com/package/@liquidau/solvers). Pair it with
+[`@liquidau/rule-miner`](https://www.npmjs.com/package/@liquidau/rule-miner) for rules and weak labels.
+
+## Install
+
+```bash
+npm install @liquidau/embedding-classifier
+```
 
 ## Example
 
 ```ts
-import { trainHeads, assertRoundTrip, decide, scoreEmbedding, validateArtifact } from '@liquidau/embedding-classifier';
+import { decide, scoreEmbedding, trainHeads, type ClassifierArtifact, type Split } from '@liquidau/embedding-classifier';
 
-const result = trainHeads({
-  X: embeddings,                  // number[][]
-  split,                          // ('train' | 'calibration' | 'test')[]
-  groups,                         // optional: paraphrases of one seed share a group
-  slices: { source: sources },    // optional: recall per source=…
-  heads: [
-    { name: 'urgent', y: yUrgent, prevalence: 0.005, baseline: rulesCaught,
-      policy: { kind: 'recall', targetRecall: 0.95, designRecall: 0.98, maxFalseAlarm: 0.05, minPositives: 150, minRecallLower: 0.9 } },
-    { name: 'off_topic', y: yOffTopic, prevalence: 0.05, policy: { kind: 'precision', targetPrecision: 0.8 } },
-  ],
-});
-const artifact = { version, created_at, embedding: { model_id, dimensions, normalize: true },
-  heads: result.heads, evaluation: result.evaluation,
-  gates: { passed: result.failures.length === 0, failures: result.failures, warnings: result.warnings } };
-assertRoundTrip(artifact, embeddings, result.testProbabilities);
+// Toy data: 900 two-dimensional "embeddings"; urgent ones sit up and to the right.
+const y = Array.from({ length: 900 }, (_, i) => (i % 10 === 0 ? 1 : 0) as 0 | 1);
+const X = y.map((v, i) => [2 * v + Math.sin(i), 2 * v + Math.cos(1.7 * i)]);
+const split = y.map((_, i): Split => (['train', 'calibration', 'test'] as const)[i % 3]);
 
-// Runtime
-const model = validateArtifact(JSON.parse(json), { heads: ['urgent', 'off_topic'] });
-const decision = decide(model, scoreEmbedding(model, await embed(text)), {
-  priority: ['urgent', 'off_topic'],
-  suppress: [{ when: ['urgent'], heads: ['off_topic'] }],
-});
-// -> { head: 'urgent' | 'off_topic' | null, reason: 'above_threshold' | 'near_threshold' | 'none' }
+const result = trainHeads({ X, split, heads: [{ name: 'urgent', y, prevalence: 0.1, policy: { kind: 'recall', targetRecall: 0.9, designRecall: 0.95 } }] });
+console.log(result.failures); // [] when every release gate passed
+
+const artifact: ClassifierArtifact = { version: '1', created_at: '2026-10-03', embedding: { model_id: 'toy', dimensions: 2, normalize: false }, heads: result.heads };
+console.log(decide(artifact, scoreEmbedding(artifact, [2.1, 1.9]), { priority: ['urgent'] })); // { head: 'urgent', reason: 'above_threshold' }
 ```
 
-`near_threshold` means at least one head is in its review band (`review_floor` ≤ p < threshold).
-That band is the natural set of examples to sample for human labelling.
+A two-head version with a rules baseline, slices and gates is in [docs/EXAMPLE.md](docs/EXAMPLE.md).
+
+## Which threshold mode
+
+| Mode | Use when | Guarantee |
+|---|---|---|
+| `heuristic` | Exploring, low stakes (the default) | None |
+| `conformal-expected` | Recall heads, calibration not design-sampled | Recall on average |
+| `conformal-pac` | Recall heads, enough calibration positives | Recall with probability 1 − δ |
+| `auto` | Recall heads, calibration not design-sampled | Strongest conformal guarantee the data supports |
+| `design` | Calibration came from `designSample` | Recall or precision, from the sample design |
+
+**Conformal modes and `auto` refuse design-sampled calibration; precision heads take only
+`heuristic` or `design`.** Details in [docs/THRESHOLDS.md](docs/THRESHOLDS.md).
+
+## What's in it
+
+| Area | Exports |
+|---|---|
+| Training | `trainHeads`, `assertRoundTrip` |
+| Thresholds | `pickThreshold`, `conformalThreshold`, `budgetThreshold` |
+| Evaluation, gates | `evaluateHead`, `gateHead`, `reportMarkdown` |
+| Runtime | `validateArtifact`, `scoreEmbedding`, `decide` |
+| Lifecycle, drift | `loadOrder`, `publishPlan`, `monitorWindow` |
+| Labelling | `designSample`, `labelQueue`, `applyReviews` |
+| Training data | `retrieveFromSeeds`, `realHardNegatives`, `verifyBatch`, `coverageReport` |
+| Provenance | `ExampleRecord`, `validateProvenance` |
+
+## Guarantees and limits
+
+- Only an artifact that passed its gates is enforced; a failing one runs in shadow mode only.
+- Threshold guarantees hold only if calibration examples resemble production traffic.
+- Use the same embedding model and `truncateText` at training and at runtime.
+- One linear head per label, binary.
+- `CachedEmbedder` is in the `/embedder` subpath and is Node only.
 
 ## What is deliberately not here
 
@@ -91,20 +84,22 @@ The library has no knowledge of label schemas, embedding providers, storage or w
 *does*. Your application supplies the targets per head, the embedding call (keep it identical
 between training and runtime), the baseline, the decision policy, and what happens on a decision.
 
-## Develop
+## More
 
-`@liquidau/solvers` is public on npm, so no login or token is needed to install.
+- [docs/API.md](docs/API.md): every export, and why each exists.
+- [docs/THRESHOLDS.md](docs/THRESHOLDS.md): modes, sufficiency, certified bounds, review floor, gates.
+- [docs/DATA.md](docs/DATA.md): records and rules P1–P7, sampling, labelling, retrieval, coverage.
+- [docs/EXAMPLE.md](docs/EXAMPLE.md): the full two-head example.
+
+## Develop
 
 ```bash
 npm install
-npm test        # runs this package's .ts sources; @liquidau/solvers resolves to its built dist
+npm test            # Node 20+; @liquidau/solvers resolves to its built dist
 npm run typecheck
-npm run build   # dist/ (ESM + .d.ts)
+npm run build       # dist/ (ESM + .d.ts)
 npm run check:dist  # fails if the checked-in dist/ differs from a fresh build
 ```
-
-The conformal threshold statistics live in `@liquidau/solvers` and are verified against MAPIE and
-crepes there. This package decides which guarantee each head gets.
 
 ## License
 

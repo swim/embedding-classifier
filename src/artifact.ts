@@ -7,6 +7,8 @@
  */
 import { decisionFunction, predictIsotonic, sigmoid } from '@liquidau/solvers';
 
+import { THRESHOLD_MODES, type Guarantee } from './conformal.ts';
+
 export type Calibration =
   | { method: 'platt'; a: number; c: number }
   | { method: 'isotonic'; x: number[]; y: number[] };
@@ -24,6 +26,10 @@ export interface HeadSpec {
    * the main threshold. Interpreted by the application, not by decide().
    */
   thresholds?: Record<string, number>;
+  /** Recall heads: how the threshold was chosen and what it guarantees from calibration, for audit. */
+  guarantee?: Guarantee;
+  /** When set, review_floor is the conformal floor: at most this share of positives score below it (in expectation). */
+  review_epsilon?: number;
 }
 
 /** Records which embedding the heads were trained on - runtime must embed identically. */
@@ -103,8 +109,27 @@ export function validateArtifact<H extends string = string>(raw: unknown, option
       throw new Error(`head ${name} needs 0 <= review_floor <= threshold (got ${spec.review_floor}, ${spec.threshold})`);
     }
     for (const [tier, t] of Object.entries(spec.thresholds ?? {})) if (!isFiniteNumber(t)) throw new Error(`head ${name} has a non-numeric ${tier} threshold`);
+    if (spec.guarantee !== undefined) validateGuarantee(name, spec.guarantee);
+    if (spec.review_epsilon !== undefined && !(isFiniteNumber(spec.review_epsilon) && spec.review_epsilon > 0 && spec.review_epsilon < 1)) {
+      throw new Error(`head ${name} has a review_epsilon outside (0, 1)`);
+    }
   }
   return a;
+}
+
+const isRate = (v: unknown) => isFiniteNumber(v) && v > 0 && v < 1;
+
+/** A stored guarantee must be one its mode can produce, with the parameters that make it meaningful. */
+function validateGuarantee(name: string, g: Guarantee): void {
+  if (!g || typeof g !== 'object' || !THRESHOLD_MODES.includes(g.mode)) throw new Error(`head ${name} has an unknown threshold mode ${g?.mode}`);
+  if (!isRate(g.alpha)) throw new Error(`head ${name}: guarantee alpha must be in (0, 1)`);
+  const allowed: Record<string, readonly string[]> = { heuristic: ['none'], 'conformal-expected': ['expected', 'none'], 'conformal-pac': ['pac', 'none'], auto: ['pac', 'expected', 'none'] };
+  if (!allowed[g.mode].includes(g.kind)) throw new Error(`head ${name}: mode ${g.mode} cannot give a ${g.kind} guarantee`);
+  if (g.kind === 'pac' && !isRate(g.delta)) throw new Error(`head ${name}: a pac guarantee needs delta in (0, 1)`);
+  if (g.kind !== 'pac' && g.delta !== undefined) throw new Error(`head ${name}: only a pac guarantee has a delta`);
+  for (const k of ['false_alarm', 'background_rate'] as const) {
+    if (g[k] !== undefined && (g.kind === 'none' || !isRate(g[k]))) throw new Error(`head ${name}: guarantee ${k} must be in (0, 1) and only with a guarantee`);
+  }
 }
 
 /** Calibrated probability for every head in the artifact. */

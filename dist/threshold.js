@@ -1,6 +1,32 @@
+/**
+ * Per-head policies: how a head's threshold is chosen on the calibration split and which gates it
+ * must pass on the test split.
+ *
+ *   recall     for heads where a miss is the costly error. The threshold is the highest that
+ *              reaches `designRecall` on calibration positives, set deliberately above the
+ *              gate's `targetRecall`, so a test set from the same distribution doesn't land either
+ *              side of the gate at random. It is capped so that at most `maxFalseAlarm` of
+ *              calibration negatives fire: without the cap, one mislabelled or very hard positive
+ *              can drag the threshold to ~0 and the head fires on everything. With it, a model that
+ *              can't reach the target within the budget fails its recall gate openly.
+ *              That is the `heuristic` mode: the margin is chosen by hand and guarantees nothing.
+ *              The conformal modes (see conformal.ts) instead pick the threshold from order
+ *              statistics so production recall >= targetRecall in expectation
+ *              (`conformal-expected`) or with probability 1 - delta (`conformal-pac`), with
+ *              maxFalseAlarm and any background budget certified the same way; `auto` takes the
+ *              strongest the data supports.
+ *   precision  for heads where a false alarm is the costly error. The threshold is the target
+ *              precision itself: for calibrated probabilities, messages scored >= t are on average
+ *              at least t likely to be positive.
+ */
+import { nextUp } from '@liquidau/solvers';
+/** Re-exported from @liquidau/solvers, where it now lives. */
+export { nextUp };
 export function pickThreshold(policy, p, y) {
     if (policy.kind === 'precision')
         return policy.targetPrecision;
+    if (policy.designRecall === undefined)
+        throw new Error('designRecall is required for a heuristic recall threshold');
     if (policy.designRecall < policy.targetRecall)
         throw new Error('designRecall must be >= targetRecall');
     const scored = Array.from(p);
@@ -22,16 +48,4 @@ export function budgetThreshold(threshold, background, maxRate) {
     const sorted = Array.from(background).sort((a, b) => b - a);
     const allowed = Math.floor(maxRate * sorted.length);
     return allowed < sorted.length ? Math.max(threshold, nextUp(sorted[allowed])) : threshold;
-}
-/** Smallest double strictly greater than v, so `p >= threshold` excludes v itself. */
-export function nextUp(v) {
-    if (Number.isNaN(v) || v === Infinity)
-        return v;
-    if (v === 0)
-        return Number.MIN_VALUE;
-    const buf = new DataView(new ArrayBuffer(8));
-    buf.setFloat64(0, v);
-    const bits = buf.getBigUint64(0);
-    buf.setBigUint64(0, v > 0 ? bits + 1n : bits - 1n);
-    return buf.getFloat64(0);
 }

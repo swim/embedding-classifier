@@ -11,7 +11,15 @@ export function gateHead(policy, ev, options = {}) {
         }
         if (ev.positives < minPositives)
             failures.push(`only ${ev.positives} test positives (need >= ${minPositives} for a meaningful CI)`);
-        if (!(ev.recall >= policy.targetRecall))
+        if (ev.guarantee && ev.guarantee.kind !== 'none') {
+            // The threshold already guarantees recall; a test sample falls below the target by chance
+            // about half the time even when it holds. Fail only when the test split contradicts it.
+            const upper = ev.certified?.recall_upper;
+            if (!(upper >= policy.targetRecall)) {
+                failures.push(`test recall ${ev.recall.toFixed(3)} contradicts the ${ev.guarantee.kind} guarantee: its upper bound ${upper?.toFixed(3)} < target ${policy.targetRecall}`);
+            }
+        }
+        else if (!(ev.recall >= policy.targetRecall))
             failures.push(`test recall ${ev.recall.toFixed(3)} < target ${policy.targetRecall}`);
         if (policy.minRecallLower !== undefined && !(ev.recall_ci95[0] >= policy.minRecallLower)) {
             failures.push(`recall CI lower bound ${ev.recall_ci95[0].toFixed(3)} < ${policy.minRecallLower}`);

@@ -9,16 +9,39 @@
  *              calibration negatives fire: without the cap, one mislabelled or very hard positive
  *              can drag the threshold to ~0 and the head fires on everything. With it, a model that
  *              can't reach the target within the budget fails its recall gate openly.
+ *              That is the `heuristic` mode: the margin is chosen by hand and guarantees nothing.
+ *              The conformal modes (see conformal.ts) instead pick the threshold from order
+ *              statistics so production recall >= targetRecall in expectation
+ *              (`conformal-expected`) or with probability 1 - delta (`conformal-pac`), with
+ *              maxFalseAlarm and any background budget certified the same way; `auto` takes the
+ *              strongest the data supports.
  *   precision  for heads where a false alarm is the costly error. The threshold is the target
  *              precision itself: for calibrated probabilities, messages scored >= t are on average
  *              at least t likely to be positive.
  */
+import { nextUp } from '@liquidau/solvers';
+import type { ThresholdMode } from './conformal.ts';
+/** Re-exported from @liquidau/solvers, where it now lives. */
+export { nextUp };
 export type HeadPolicy = {
     kind: 'recall';
-    /** Test-split gate. */
+    /**
+     * Heuristic: the test-split gate. Conformal: the recall the threshold guarantees (α = 1 -
+     * targetRecall); the test gate then fails only if the test split contradicts it.
+     */
     targetRecall: number;
-    /** Threshold selection target on the calibration split (>= targetRecall). */
-    designRecall: number;
+    /** Heuristic threshold selection target on the calibration split (>= targetRecall). Required for `heuristic`, and as `auto`'s last resort. */
+    designRecall?: number;
+    /** How the threshold is chosen (default `heuristic`). */
+    mode?: ThresholdMode;
+    /**
+     * auto: when the calibration data supports no guarantee at all, use the heuristic threshold
+     * with an "inconclusive" warning (true, default) or fail the head (false - e.g. for
+     * safety-critical heads). Falling back from PAC to an expected guarantee is always allowed.
+     */
+    allowHeuristicFallback?: boolean;
+    /** Conformal modes: the guarantee fails with probability at most delta (default 0.05), split across recall and every false-alarm budget. */
+    delta?: number;
     /** Highest share of calibration negatives allowed to fire (default 1: no cap). */
     maxFalseAlarm?: number;
     /** Gate: minimum test positives for the CI to mean anything (default 0). */
@@ -41,5 +64,3 @@ export declare function pickThreshold(policy: HeadPolicy, p: ArrayLike<number>, 
  * background of ordinary, mostly-negative traffic whose false alarms the labelled data can't show.
  */
 export declare function budgetThreshold(threshold: number, background: ArrayLike<number>, maxRate: number): number;
-/** Smallest double strictly greater than v, so `p >= threshold` excludes v itself. */
-export declare function nextUp(v: number): number;

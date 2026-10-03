@@ -4,11 +4,13 @@
  *   train split        weighted L2 logistic regression per head (class-balanced, exact Newton solver),
  *                      plus any weak positives (e.g. from certified rules), weighted and capped
  *   calibration split  Platt or isotonic calibrator, weighted to the head's production prevalence,
- *                      then the threshold from the head's policy
- *   test split         evaluateHead + gateHead
+ *                      then the threshold from the head's policy - heuristic or conformal (see
+ *                      conformal.ts) - and optionally a conformal review floor
+ *   test split         evaluateHead (with exact certified bounds) + gateHead
  */
-import { decisionFunction, fitIsotonic, fitLogistic, fitPlatt, prevalenceWeights, sigmoid } from '@liquidau/solvers';
+import { clopperPearsonUpper, conformalLowerThreshold, conformalRank, decisionFunction, fitIsotonic, fitLogistic, fitPlatt, minimumSamples, prevalenceWeights, sigmoid } from '@liquidau/solvers';
 
+import { conformalThreshold, groupScores, type FalseAlarmConstraint, type Guarantee, type Sufficiency } from './conformal.ts';
 import { calibrate, scoreEmbedding, validateArtifact, type Calibration, type ClassifierArtifact, type HeadSpec } from './artifact.ts';
 import { evaluateHead, type HeadEvaluation } from './evaluate.ts';
 import { gateHead } from './gates.ts';
@@ -73,6 +75,12 @@ export interface TrainInput<H extends string> {
   calibration?: 'platt' | 'isotonic';
   /** review_floor = threshold × reviewRatio (default 0.5). */
   reviewRatio?: number;
+  /**
+   * Conformal review floor instead of reviewRatio: the floor below which at most this share of
+   * positives fall, in expectation (calibration positive groups; capped at the threshold). Messages
+   * below it are dismissed automatically with that stated miss rate.
+   */
+  reviewEpsilon?: number;
   maxEce?: number;
   groups?: readonly string[];
   slices?: Readonly<Record<string, readonly string[]>>;
@@ -110,7 +118,7 @@ function indicesBySplit(split: readonly Split[], y: ReadonlyArray<0 | 1 | null>)
 }
 
 export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<H> {
-  const { X, split, C = 1, calibration: method = 'platt', reviewRatio = 0.5, maxEce, groups, slices, background, log = () => {} } = input;
+  const { X, split, C = 1, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, groups, slices, background, log = () => {} } = input;
   checkLength('split', split, X.length);
   split.forEach((s, i) => {
     if (!(SPLITS as readonly string[]).includes(s)) throw new Error(`split[${i}] is "${s}", expected one of ${SPLITS.join(', ')}`);
@@ -119,6 +127,7 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
   for (const [field, values] of Object.entries(slices ?? {})) checkLength(`slices.${field}`, values, X.length);
   if (background && Object.keys(background.maxRate).length && background.X.length === 0) throw new Error('background.X must be non-empty when a maxRate is set');
   if (!(reviewRatio >= 0 && reviewRatio <= 1)) throw new Error('reviewRatio must be between 0 and 1');
+  if (reviewEpsilon !== undefined && !(reviewEpsilon > 0 && reviewEpsilon < 1)) throw new Error('reviewEpsilon must be strictly between 0 and 1');
   const result: TrainResult<H> = { heads: {}, evaluation: {}, failures: [], warnings: [], testProbabilities: {}, weakLabels: {} };
   const vectorKey = (x: ArrayLike<number>) => Array.from(x).join(',');
   let heldOut: Set<string> | null = null;
@@ -182,13 +191,67 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
         ? { method: 'platt', ...fitPlatt(calLogits, yCal, wCal) }
         : { method: 'isotonic', ...fitIsotonic(calLogits.map(sigmoid), yCal, wCal, { yMin: 0, yMax: 1 }) };
     const pCal = calLogits.map((z) => calibrate(calibration, z));
-    let threshold = pickThreshold(policy, pCal, yCal);
+    const budget = background?.maxRate[name];
+    const backgroundP = background && budget !== undefined ? background.X.map(score) : null;
+    const heuristic = () => {
+      const t = pickThreshold(policy, pCal, yCal);
+      return backgroundP && budget !== undefined ? budgetThreshold(t, backgroundP, budget) : t;
+    };
+    // Calibration scores per class, one per group: what every conformal statement counts.
+    const calGroups = groups && idx.calibration.map((i) => groups[i]);
+    const ofClass = (c: number) => <T>(values: readonly T[]) => values.filter((_, j) => yCal[j] === c);
+    const positives = groupScores(ofClass(1)(pCal), calGroups && ofClass(1)(calGroups), Math.min);
+    const delta = policy.kind === 'recall' ? policy.delta ?? 0.05 : 0.05;
+
+    let threshold: number;
+    let guarantee: Guarantee | undefined;
+    let sufficiency: Sufficiency | undefined;
+    // Every background rank a threshold could have been capped at - for a bound valid whichever applied.
+    const backgroundRanks: number[] = [];
+    if (backgroundP && budget !== undefined && Math.floor(budget * backgroundP.length) < backgroundP.length) backgroundRanks.push(Math.floor(budget * backgroundP.length));
+    const mode = policy.kind === 'recall' ? policy.mode ?? 'heuristic' : 'heuristic';
+    if (policy.kind === 'recall' && mode !== 'heuristic') {
+      const constraints: FalseAlarmConstraint[] = [];
+      if (policy.maxFalseAlarm !== undefined && policy.maxFalseAlarm < 1) {
+        constraints.push({ name: 'calibration false-alarm', scores: groupScores(ofClass(0)(pCal), calGroups && ofClass(0)(calGroups), Math.max), maxRate: policy.maxFalseAlarm });
+      }
+      if (backgroundP && budget !== undefined) constraints.push({ name: 'background', scores: backgroundP, maxRate: budget });
+      const sel = conformalThreshold({ mode, targetRecall: policy.targetRecall, delta, positives, constraints, heuristicAvailable: policy.designRecall !== undefined, allowHeuristic: policy.allowHeuristicFallback });
+      if (backgroundP && budget !== undefined) {
+        for (const d of [undefined, delta / (1 + constraints.length)]) backgroundRanks.push(conformalRank(backgroundP.length, budget, d));
+      }
+      if (calibration.method === 'platt' && !(calibration.a > 0)) {
+        sel.failures.push(`Platt slope ${calibration.a} reverses the model's score order, so no conformal guarantee holds`);
+        sel.guarantee = { mode, kind: 'none', alpha: sel.guarantee.alpha };
+      }
+      threshold = sel.threshold ?? heuristic();
+      guarantee = sel.guarantee;
+      sufficiency = sel.sufficiency;
+      sufficiency.chosen = sel.threshold === null ? 'heuristic' : sufficiency.chosen;
+      if (slices) {
+        const perTest = delta / (1 + constraints.length);
+        const needed = { expected: minimumSamples(guarantee.alpha), pac: minimumSamples(guarantee.alpha, perTest) };
+        sufficiency.slices = {};
+        for (const [field, values] of Object.entries(slices)) {
+          const calValues = ofClass(1)(idx.calibration.map((i) => values[i]));
+          const calPosGroups = calGroups && ofClass(1)(calGroups);
+          for (const v of [...new Set(calValues)].sort()) {
+            const n = new Set(calValues.flatMap((x, j) => (x === v ? [calPosGroups ? calPosGroups[j] : `#${j}`] : []))).size;
+            sufficiency.slices[`${field}=${v}`] = { positive_groups: n, feasible: [...(n >= needed.expected ? ['conformal-expected' as const] : []), ...(n >= needed.pac ? ['conformal-pac' as const] : [])] };
+          }
+        }
+      }
+      result.failures.push(...sel.failures.map((f) => `${name}: ${f}`));
+      result.warnings.push(...sel.warnings.map((w) => `${name}: ${w}`));
+      log(`${name}: ${mode} threshold ${threshold} (${guarantee.kind} guarantee, ${positives.length} calibration positive groups)`);
+    } else {
+      threshold = heuristic();
+      if (policy.kind === 'recall') guarantee = { mode: 'heuristic', kind: 'none', alpha: 1 - policy.targetRecall };
+    }
     if (policy.kind === 'precision' && !pCal.some((p) => p >= threshold)) {
       result.warnings.push(`${name}: no calibration example reaches the target precision ${threshold} - the head is unlikely ever to fire`);
     }
-    const budget = background?.maxRate[name];
-    const backgroundP = background && budget !== undefined ? background.X.map(score) : null;
-    if (backgroundP && budget !== undefined) threshold = budgetThreshold(threshold, backgroundP, budget);
+    const reviewFloor = reviewEpsilon === undefined ? threshold * reviewRatio : Math.min(threshold, conformalLowerThreshold(positives, reviewEpsilon) ?? 0);
 
     const yTest = ySplit('test');
     const pTest = idx.test.map((i) => score(X[i]));
@@ -201,16 +264,40 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
       groups: groups && atTest(groups),
       slices: slices && Object.fromEntries(Object.entries(slices).map(([field, values]) => [field, atTest(values)])),
       baseline: baseline && atTest(baseline),
+      delta,
+      prevalence,
     });
-    if (backgroundP) ev.background_rate = backgroundP.filter((p) => p >= threshold).length / backgroundP.length;
+    if (guarantee) ev.guarantee = guarantee;
+    if (sufficiency) ev.sufficiency = sufficiency;
+    if (backgroundP) {
+      ev.background_rate = backgroundP.filter((p) => p >= threshold).length / backgroundP.length;
+      ev.background_rate_upper = backgroundUpper(backgroundP, threshold, backgroundRanks, 1 - delta / 2);
+    }
     const gates = gateHead(policy, ev, { maxEce });
     result.evaluation[name] = ev;
     result.failures.push(...gates.failures.map((f) => `${name}: ${f}`));
     result.warnings.push(...gates.warnings.map((w) => `${name}: ${w}`));
-    result.heads[name] = { weights: model.coef, bias: model.intercept, calibration, threshold, review_floor: threshold * reviewRatio };
+    result.heads[name] = {
+      weights: model.coef, bias: model.intercept, calibration, threshold, review_floor: reviewFloor,
+      ...(guarantee ? { guarantee } : {}), ...(reviewEpsilon !== undefined ? { review_epsilon: reviewEpsilon } : {}),
+    };
     result.testProbabilities[name] = { idx: idx.test, p: pTest };
   }
   return result;
+}
+
+/**
+ * Exact upper bound on the background firing rate at `threshold`. A threshold capped by the
+ * background itself sits at or above the score just past a FIXED rank r, whose firing rate is a
+ * uniform order statistic - so the bound for the largest rank any cap could have used is valid
+ * whichever cap applied. Otherwise the threshold never looked at the background and its count is
+ * an ordinary binomial.
+ */
+function backgroundUpper(scores: readonly number[], threshold: number, ranks: readonly number[], confidence: number): number {
+  const sorted = [...scores].sort((a, b) => b - a);
+  const r = Math.max(-1, ...ranks.filter((k) => k < sorted.length));
+  if (r >= 0 && threshold > sorted[r]) return clopperPearsonUpper(r, sorted.length, confidence);
+  return clopperPearsonUpper(sorted.filter((p) => p >= threshold).length, sorted.length, confidence);
 }
 
 /**

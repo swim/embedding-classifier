@@ -62,6 +62,12 @@ export interface TrainInput<H extends string> {
     calibration?: 'platt' | 'isotonic';
     /** review_floor = threshold × reviewRatio (default 0.5). */
     reviewRatio?: number;
+    /**
+     * Conformal review floor instead of reviewRatio: the floor below which at most this share of
+     * positives fall, in expectation (calibration positive groups; capped at the threshold). Messages
+     * below it are dismissed automatically with that stated miss rate.
+     */
+    reviewEpsilon?: number;
     maxEce?: number;
     groups?: readonly string[];
     slices?: Readonly<Record<string, readonly string[]>>;

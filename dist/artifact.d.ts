@@ -1,3 +1,4 @@
+import { type Guarantee } from './conformal.ts';
 export type Calibration = {
     method: 'platt';
     a: number;
@@ -20,6 +21,10 @@ export interface HeadSpec {
      * the main threshold. Interpreted by the application, not by decide().
      */
     thresholds?: Record<string, number>;
+    /** Recall heads: how the threshold was chosen and what it guarantees from calibration, for audit. */
+    guarantee?: Guarantee;
+    /** When set, review_floor is the conformal floor: at most this share of positives score below it (in expectation). */
+    review_epsilon?: number;
 }
 /** Records which embedding the heads were trained on - runtime must embed identically. */
 export interface EmbeddingSpec {

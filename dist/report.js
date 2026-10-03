@@ -20,6 +20,26 @@ export function reportMarkdown(artifact, options = {}) {
         if (!spec || !ev)
             continue;
         lines.push('', `## ${head}`, '', `threshold ${f4(spec.threshold)} · review floor ${f4(spec.review_floor)} · calibration ${spec.calibration?.method ?? 'n/a'}`, '', '| metric | value |', '|---|---|', `| test positives / n | ${ev.positives ?? 'n/a'} / ${ev.n ?? 'n/a'} (from ${ev.positive_groups ?? 'n/a'} distinct group(s)) |`, `| recall (95% CI) | ${f3(ev.recall)} (${ci(ev.recall_ci95)}) |`, `| false-alarm rate | ${f3(ev.false_alarm_rate)} |`, `| precision (prevalence-weighted) | ${f3(ev.precision_prevalence_weighted)} |`, `| ECE (prevalence-weighted) | ${f4(ev.ece_prevalence_weighted)} |`);
+        const c = ev.certified;
+        if (c) {
+            lines.push(`| certified recall ≥ (test, exact) | ${f3(c.recall_lower)} over ${c.positive_groups} positive group(s) |`, `| certified false-alarm rate ≤ (test, exact) | ${f4(c.false_alarm_upper)} over ${c.negative_groups} negative group(s) |`, ...(c.precision_lower !== undefined ? [`| certified precision ≥ (at production prevalence) | ${f3(c.precision_lower)} |`] : []), ...(ev.background_rate_upper !== undefined ? [`| certified background rate ≤ | ${f4(ev.background_rate_upper)} |`] : []));
+        }
+        if (c)
+            lines.push('', `Certified bounds hold together with probability ${f3(1 - c.delta)}, whatever chose the threshold.`);
+        const g = ev.guarantee;
+        if (g) {
+            const what = g.kind === 'pac' ? `recall ≥ ${f3(1 - g.alpha)} with probability ${f3(1 - (g.delta ?? 0))}` : g.kind === 'expected' ? `recall ≥ ${f3(1 - g.alpha)} in expectation over calibration draws` : 'nothing (no conformal guarantee)';
+            const budgets = [g.false_alarm !== undefined ? `calibration false alarms ≤ ${g.false_alarm}` : '', g.background_rate !== undefined ? `background rate ≤ ${g.background_rate}` : ''].filter(Boolean);
+            lines.push('', `Threshold mode **${g.mode}**${ev.sufficiency ? ` (used: ${ev.sufficiency.chosen})` : ''}: guarantees ${what}${budgets.length ? `, with ${budgets.join(' and ')}` : ''}.`);
+            const s = ev.sufficiency;
+            if (s) {
+                lines.push(`Calibration positive groups: ${s.positive_groups} (expected guarantee needs ${s.needed.expected}, PAC ${s.needed.pac}); feasible: ${s.feasible.join(', ') || 'none'}${s.reason ? `. ${s.reason}` : ''}.`);
+                for (const [slice, v] of Object.entries(s.slices ?? {}))
+                    lines.push(`- ${slice}: ${v.positive_groups} positive group(s), per-slice guarantee feasible: ${v.feasible.join(', ') || 'none'}`);
+            }
+        }
+        if (spec.review_epsilon !== undefined)
+            lines.push('', `Review floor is conformal: at most ${spec.review_epsilon} of positives score below it, in expectation.`);
         if (ev.vs_baseline) {
             lines.push(`| **recall with the ${baselineName} (${baselineName} OR classifier)** | **${f3(ev.combined_recall)} (${ci(ev.combined_recall_ci95)})** |`, `| false-alarm rate with the ${baselineName} | ${f3(ev.combined_false_alarm_rate)} |`, '', `vs ${baselineName} (test positives): ` + Object.entries(ev.vs_baseline).map(([k, v]) => `${k} ${v}`).join(', '));
         }

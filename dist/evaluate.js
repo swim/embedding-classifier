@@ -1,10 +1,14 @@
 /**
  * Test-split evaluation of one head: recall with a Wilson CI, false-alarm rate,
- * prevalence-weighted precision and ECE, a reliability table, recall per slice, and (when a
- * baseline is supplied, e.g. existing rules) what the classifier adds on top of it.
+ * prevalence-weighted precision and ECE, a reliability table, recall per slice, (when a baseline
+ * is supplied, e.g. existing rules) what the classifier adds on top of it, and exact certified
+ * bounds for the shipped threshold whatever chose it.
  */
-import { ece, wilson } from '@liquidau/solvers';
-export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline }) {
+import { clopperPearsonUpper, ece, wilson } from '@liquidau/solvers';
+const clopperPearsonLower = (k, n, confidence) => 1 - clopperPearsonUpper(n - k, n, confidence);
+export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline, delta = 0.05, prevalence }) {
+    if (!(delta > 0 && delta < 1))
+        throw new Error(`delta must be strictly between 0 and 1, got ${delta}`);
     const lengths = [['y', y], ['w', w], ['groups', groups], ['baseline', baseline], ...Object.entries(slices).map(([f, v]) => [`slices.${f}`, v])];
     for (const [name, values] of lengths) {
         if (values !== undefined && values.length !== p.length)
@@ -25,6 +29,29 @@ export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline
         }
     });
     const calibration = ece(p, y, w);
+    // Per group: [all members fired, any member fired], separately for each class.
+    const byGroup = [new Map(), new Map()];
+    p.forEach((_, i) => {
+        if (y[i] !== 0 && y[i] !== 1)
+            return;
+        const g = groups ? groups[i] : `#${i}`;
+        const prior = byGroup[y[i]].get(g) ?? [true, false];
+        byGroup[y[i]].set(g, [prior[0] && fired[i], prior[1] || fired[i]]);
+    });
+    const tally = (cls, which) => [...byGroup[cls].values()].filter((v) => v[which]).length;
+    const [posGroups, negGroups] = [byGroup[1].size, byGroup[0].size];
+    const conf = 1 - delta / 2;
+    const certified = {
+        delta, positive_groups: posGroups, negative_groups: negGroups,
+        recall_lower: posGroups ? clopperPearsonLower(tally(1, 0), posGroups, conf) : 0,
+        recall_upper: posGroups ? clopperPearsonUpper(tally(1, 1), posGroups, conf) : 1,
+        false_alarm_upper: negGroups ? clopperPearsonUpper(tally(0, 1), negGroups, conf) : 1,
+    };
+    if (prevalence !== undefined) {
+        const tp = prevalence * certified.recall_lower;
+        const fp = (1 - prevalence) * certified.false_alarm_upper;
+        certified.precision_lower = tp + fp === 0 ? 0 : tp / (tp + fp);
+    }
     const result = {
         threshold,
         n: y.length,
@@ -38,6 +65,7 @@ export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline
         ece_prevalence_weighted: calibration.ece,
         reliability: calibration.reliability,
         slices: {},
+        certified,
     };
     for (const [field, values] of Object.entries(slices)) {
         for (const v of [...new Set(values)].sort()) {

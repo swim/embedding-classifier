@@ -1,9 +1,28 @@
 /**
  * Test-split evaluation of one head: recall with a Wilson CI, false-alarm rate,
- * prevalence-weighted precision and ECE, a reliability table, recall per slice, and (when a
- * baseline is supplied, e.g. existing rules) what the classifier adds on top of it.
+ * prevalence-weighted precision and ECE, a reliability table, recall per slice, (when a baseline
+ * is supplied, e.g. existing rules) what the classifier adds on top of it, and exact certified
+ * bounds for the shipped threshold whatever chose it.
  */
 import { type ReliabilityRow } from '@liquidau/solvers';
+import type { Guarantee, Sufficiency } from './conformal.ts';
+/**
+ * Exact (Clopper-Pearson) bounds from the test split, which no threshold method sees - so they are
+ * valid for any threshold, heuristic or conformal. Each holds with probability 1 - delta/2, so
+ * recall_lower and false_alarm_upper (and precision_lower, derived from both) hold together with
+ * probability 1 - delta. Groups count once: a positive group is caught for the lower bound only if
+ * every member fires, and for the upper bound if any does; a negative group fires if any member does.
+ */
+export interface CertifiedBounds {
+    delta: number;
+    positive_groups: number;
+    negative_groups: number;
+    recall_lower: number;
+    recall_upper: number;
+    false_alarm_upper: number;
+    /** At the head's production prevalence: π·R_L / (π·R_L + (1 - π)·FA_U). */
+    precision_lower?: number;
+}
 export interface BaselineComparison {
     caught_by_both: number;
     caught_by_baseline_only: number;
@@ -37,6 +56,12 @@ export interface HeadEvaluation {
     combined_false_alarm_rate?: number;
     /** Share of the background the head fires on at its final threshold (when a budget was applied). */
     background_rate?: number;
+    /** Exact upper bound on the background firing rate (probability 1 - delta/2), valid even when the background chose the threshold. */
+    background_rate_upper?: number;
+    certified: CertifiedBounds;
+    /** Recall heads: what the shipped threshold guarantees from calibration, and why. */
+    guarantee?: Guarantee;
+    sufficiency?: Sufficiency;
 }
 export interface EvaluateInput {
     /** Calibrated probabilities. */
@@ -51,5 +76,9 @@ export interface EvaluateInput {
     slices?: Readonly<Record<string, readonly string[]>>;
     /** Whether an existing mechanism already catches each example. */
     baseline?: readonly boolean[];
+    /** Certified bounds fail with probability at most delta (default 0.05). */
+    delta?: number;
+    /** Production prevalence, for certified.precision_lower. */
+    prevalence?: number;
 }
-export declare function evaluateHead({ p, y, w, threshold, groups, slices, baseline }: EvaluateInput): HeadEvaluation;
+export declare function evaluateHead({ p, y, w, threshold, groups, slices, baseline, delta, prevalence }: EvaluateInput): HeadEvaluation;

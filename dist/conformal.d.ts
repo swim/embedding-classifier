@@ -19,6 +19,8 @@ export interface Guarantee {
     delta?: number;
     /** Design guarantees: the estimator behind the bound. */
     method?: 'exact' | 'linearised' | 'bootstrap';
+    /** What the guarantee is about (default 'recall'): alpha is 1 - the target recall or precision. */
+    metric?: 'recall' | 'precision';
     /** Certified share of calibration negatives that may fire (from maxFalseAlarm). */
     false_alarm?: number;
     /** Certified share of background text that may fire (from the background budget). */

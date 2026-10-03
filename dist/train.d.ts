@@ -76,6 +76,12 @@ export interface TrainInput<H extends string> {
      */
     reviewEpsilon?: number;
     maxEce?: number;
+    /**
+     * Fail a head whose test-split probabilities Cox's recalibration test rejects at this level (default
+     * off). Prefer it to maxEce for rare classes: in simulation the ECE > 0.05 gate never fired at 2%
+     * prevalence, even for badly miscalibrated probabilities.
+     */
+    calibrationAlpha?: number;
     groups?: readonly string[];
     slices?: Readonly<Record<string, readonly string[]>>;
     /**

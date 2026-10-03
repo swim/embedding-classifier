@@ -23,3 +23,5 @@ export type { Embedded, RetrieveOptions } from './retrieval.ts';
 export { realHardNegatives, selectForReview, verifyBatch } from './hardnegatives.ts';
 export { checkSliceAxes, coverageReport, defineAxes } from './coverage.ts';
 export type { Axes, CoverageReport } from './coverage.ts';
+export { monitorWindow } from './monitor.ts';
+export type { DriftCheck } from './monitor.ts';

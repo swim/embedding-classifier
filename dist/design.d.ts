@@ -41,6 +41,11 @@ export interface DesignSummary {
     };
     /** Strata that could not reach minExpectedPositives even when taken whole, and similar notes. */
     warnings: string[];
+    /** Small strata merged before sampling (mergeSmallStrata): the merged stratum and its original cells. */
+    merged: Array<{
+        name: string;
+        from: string[];
+    }>;
     scoringModel: string;
     seed: number;
     /** Frame items removed because their group already had one. */
@@ -53,6 +58,13 @@ export interface DesignOptions {
     scoreBands: readonly number[];
     /** Cross strata with signals.slice (default false). */
     bySlice?: boolean;
+    /**
+     * Merge strata too small to give 2 calibration and 2 test items into their closest neighbour -
+     * an adjacent score band with the same rule firing and slice, else the same band in another slice,
+     * else the other rule-firing value (default true; false throws instead). Decided from frame counts
+     * alone, before sampling, so the design stays a valid stratified sample (collapsed strata).
+     */
+    mergeSmallStrata?: boolean;
     allocation: {
         total: number;
         method: 'proportional' | 'manual' | 'expected-positives';

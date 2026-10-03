@@ -14,7 +14,7 @@
  * already reproduces production prevalence, so `prevalence` must not be passed), and the test
  * metrics become design-based estimates. The `design` threshold mode then applies.
  */
-import { clopperPearsonUpper, conformalLowerThreshold, conformalRank, decisionFunction, designRiskThreshold, fitIsotonic, fitLogistic, fitPlatt, minimumSamples, nextUp, prevalenceWeights, sigmoid } from '@liquidau/solvers';
+import { clopperPearsonUpper, conformalLowerThreshold, conformalRank, decisionFunction, designPrecisionThreshold, designRiskThreshold, fitIsotonic, fitLogistic, fitPlatt, minimumSamples, nextUp, prevalenceWeights, sigmoid } from '@liquidau/solvers';
 
 import { designOf, type DesignSummary } from './design.ts';
 import { capTrainingWeights, validateProvenance, type ExampleRecord, type ProvenanceCode, type ProvenanceOptions, type WeightCaps, type WeightCapSummary } from './records.ts';
@@ -95,6 +95,12 @@ export interface TrainInput<H extends string> {
    */
   reviewEpsilon?: number;
   maxEce?: number;
+  /**
+   * Fail a head whose test-split probabilities Cox's recalibration test rejects at this level (default
+   * off). Prefer it to maxEce for rare classes: in simulation the ECE > 0.05 gate never fired at 2%
+   * prevalence, even for badly miscalibrated probabilities.
+   */
+  calibrationAlpha?: number;
   groups?: readonly string[];
   slices?: Readonly<Record<string, readonly string[]>>;
   /**
@@ -164,7 +170,7 @@ function indicesBySplit(split: readonly Split[], y: ReadonlyArray<0 | 1 | null>)
 }
 
 export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<H> {
-  const { X, split, C = 1, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, groups, slices, background, records, seed = 0, log = () => {} } = input;
+  const { X, split, C = 1, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, groups, slices, background, records, seed = 0, log = () => {} } = input;
   checkLength('split', split, X.length);
   split.forEach((s, i) => {
     if (!(SPLITS as readonly string[]).includes(s)) throw new Error(`split[${i}] is "${s}", expected one of ${SPLITS.join(', ')}`);
@@ -294,7 +300,7 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
     const calGroups = groups && idx.calibration.map((i) => groups[i]);
     const ofClass = (c: number) => <T>(values: readonly T[]) => values.filter((_, j) => yCal[j] === c);
     const positives = groupScores(ofClass(1)(pCal), calGroups && ofClass(1)(calGroups), Math.min);
-    const delta = policy.kind === 'recall' ? policy.delta ?? 0.05 : 0.05;
+    const delta = policy.delta ?? 0.05;
 
     let threshold!: number;
     let guarantee: Guarantee | undefined;
@@ -371,6 +377,36 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
       result.failures.push(...sel.failures.map((f) => `${name}: ${f}`));
       result.warnings.push(...sel.warnings.map((w) => `${name}: ${w}`));
       log(`${name}: ${mode} threshold ${threshold} (${guarantee.kind} guarantee, ${positives.length} calibration positive groups)`);
+    } else if (policy.kind === 'precision' && policy.mode === 'design') {
+      if (!calDesign) throw new Error(`${name}: precision mode 'design' needs sampled calibration records (records)`);
+      const designMethod = policy.designMethod ?? 'linearised';
+      // Candidates fixed before calibration: training-split logits (evenly spaced ranks from the 30th
+      // highest down), mapped through the calibrator so the bound is computed on the firing rule that ships.
+      const trainZ = idx.train.map((i) => decisionFunction(model, X[i])).sort((a, b) => b - a);
+      const start = Math.min(29, trainZ.length - 1);
+      const ranks = Array.from({ length: 150 }, (_, k) => start + Math.floor((k * (trainZ.length - 1 - start)) / 149));
+      const candidates = [...new Set(ranks.map((r) => calibrate(calibration, trainZ[r])))].sort((a, b) => b - a);
+      const res = designPrecisionThreshold({ ...calDesign, y: yCal, scores: pCal, candidates, targetPrecision: policy.targetPrecision, delta, method: designMethod });
+      const alpha = 1 - policy.targetPrecision;
+      if (res.feasible) {
+        threshold = res.threshold;
+        guarantee = { mode: 'design', kind: res.guarantee, alpha, delta, method: designMethod, metric: 'precision' };
+        if (backgroundP && budget !== undefined) {
+          const t = budgetThreshold(threshold, backgroundP, budget);
+          if (t > threshold) {
+            result.warnings.push(`${name}: design: the background budget raised the threshold from ${threshold} to ${t}; precision there is not covered by the guarantee`);
+            threshold = t;
+            guarantee = { mode: 'design', kind: 'none', alpha, metric: 'precision' };
+          }
+          if (Math.floor(budget * backgroundP.length) < backgroundP.length) backgroundRanks.push(Math.floor(budget * backgroundP.length));
+        }
+        log(`${name}: design precision threshold ${threshold} (${res.guarantee}, ${designMethod}, ${res.firedEffective.toFixed(1)} effective fired)`);
+      } else {
+        result.failures.push(`${name}: design: ${res.reason}`);
+        threshold = nextUp(1);
+        guarantee = { mode: 'design', kind: 'none', alpha, metric: 'precision' };
+      }
+      result.design!.heads[name] = { calibration: 'design-weighted', threshold: `design precision (${designMethod})`, evaluation: 'design-linearised' };
     } else {
       threshold = heuristic();
       if (policy.kind === 'recall') guarantee = { mode: 'heuristic', kind: 'none', alpha: 1 - policy.targetRecall };
@@ -403,7 +439,7 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
       ev.background_rate = backgroundP.filter((p) => p >= threshold).length / backgroundP.length;
       ev.background_rate_upper = backgroundUpper(backgroundP, threshold, backgroundRanks, 1 - delta / 2);
     }
-    const gates = gateHead(policy, ev, { maxEce });
+    const gates = gateHead(policy, ev, { maxEce, calibrationAlpha });
     result.evaluation[name] = ev;
     result.failures.push(...gates.failures.map((f) => `${name}: ${f}`));
     result.warnings.push(...gates.warnings.map((w) => `${name}: ${w}`));

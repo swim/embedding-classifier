@@ -14,7 +14,7 @@
  * already reproduces production prevalence, so `prevalence` must not be passed), and the test
  * metrics become design-based estimates. The `design` threshold mode then applies.
  */
-import { clopperPearsonUpper, conformalLowerThreshold, conformalRank, decisionFunction, designRiskThreshold, fitIsotonic, fitLogistic, fitPlatt, minimumSamples, nextUp, prevalenceWeights, sigmoid } from '@liquidau/solvers';
+import { clopperPearsonUpper, conformalLowerThreshold, conformalRank, decisionFunction, designPrecisionThreshold, designRiskThreshold, fitIsotonic, fitLogistic, fitPlatt, minimumSamples, nextUp, prevalenceWeights, sigmoid } from '@liquidau/solvers';
 import { designOf } from "./design.js";
 import { capTrainingWeights, validateProvenance } from "./records.js";
 import { conformalThreshold, groupScores } from "./conformal.js";
@@ -36,7 +36,7 @@ function indicesBySplit(split, y) {
     return idx;
 }
 export function trainHeads(input) {
-    const { X, split, C = 1, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, groups, slices, background, records, seed = 0, log = () => { } } = input;
+    const { X, split, C = 1, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, groups, slices, background, records, seed = 0, log = () => { } } = input;
     checkLength('split', split, X.length);
     split.forEach((s, i) => {
         if (!SPLITS.includes(s))
@@ -181,7 +181,7 @@ export function trainHeads(input) {
         const calGroups = groups && idx.calibration.map((i) => groups[i]);
         const ofClass = (c) => (values) => values.filter((_, j) => yCal[j] === c);
         const positives = groupScores(ofClass(1)(pCal), calGroups && ofClass(1)(calGroups), Math.min);
-        const delta = policy.kind === 'recall' ? policy.delta ?? 0.05 : 0.05;
+        const delta = policy.delta ?? 0.05;
         let threshold;
         let guarantee;
         let sufficiency;
@@ -266,6 +266,40 @@ export function trainHeads(input) {
             result.warnings.push(...sel.warnings.map((w) => `${name}: ${w}`));
             log(`${name}: ${mode} threshold ${threshold} (${guarantee.kind} guarantee, ${positives.length} calibration positive groups)`);
         }
+        else if (policy.kind === 'precision' && policy.mode === 'design') {
+            if (!calDesign)
+                throw new Error(`${name}: precision mode 'design' needs sampled calibration records (records)`);
+            const designMethod = policy.designMethod ?? 'linearised';
+            // Candidates fixed before calibration: training-split logits (evenly spaced ranks from the 30th
+            // highest down), mapped through the calibrator so the bound is computed on the firing rule that ships.
+            const trainZ = idx.train.map((i) => decisionFunction(model, X[i])).sort((a, b) => b - a);
+            const start = Math.min(29, trainZ.length - 1);
+            const ranks = Array.from({ length: 150 }, (_, k) => start + Math.floor((k * (trainZ.length - 1 - start)) / 149));
+            const candidates = [...new Set(ranks.map((r) => calibrate(calibration, trainZ[r])))].sort((a, b) => b - a);
+            const res = designPrecisionThreshold({ ...calDesign, y: yCal, scores: pCal, candidates, targetPrecision: policy.targetPrecision, delta, method: designMethod });
+            const alpha = 1 - policy.targetPrecision;
+            if (res.feasible) {
+                threshold = res.threshold;
+                guarantee = { mode: 'design', kind: res.guarantee, alpha, delta, method: designMethod, metric: 'precision' };
+                if (backgroundP && budget !== undefined) {
+                    const t = budgetThreshold(threshold, backgroundP, budget);
+                    if (t > threshold) {
+                        result.warnings.push(`${name}: design: the background budget raised the threshold from ${threshold} to ${t}; precision there is not covered by the guarantee`);
+                        threshold = t;
+                        guarantee = { mode: 'design', kind: 'none', alpha, metric: 'precision' };
+                    }
+                    if (Math.floor(budget * backgroundP.length) < backgroundP.length)
+                        backgroundRanks.push(Math.floor(budget * backgroundP.length));
+                }
+                log(`${name}: design precision threshold ${threshold} (${res.guarantee}, ${designMethod}, ${res.firedEffective.toFixed(1)} effective fired)`);
+            }
+            else {
+                result.failures.push(`${name}: design: ${res.reason}`);
+                threshold = nextUp(1);
+                guarantee = { mode: 'design', kind: 'none', alpha, metric: 'precision' };
+            }
+            result.design.heads[name] = { calibration: 'design-weighted', threshold: `design precision (${designMethod})`, evaluation: 'design-linearised' };
+        }
         else {
             threshold = heuristic();
             if (policy.kind === 'recall')
@@ -301,7 +335,7 @@ export function trainHeads(input) {
             ev.background_rate = backgroundP.filter((p) => p >= threshold).length / backgroundP.length;
             ev.background_rate_upper = backgroundUpper(backgroundP, threshold, backgroundRanks, 1 - delta / 2);
         }
-        const gates = gateHead(policy, ev, { maxEce });
+        const gates = gateHead(policy, ev, { maxEce, calibrationAlpha });
         result.evaluation[name] = ev;
         result.failures.push(...gates.failures.map((f) => `${name}: ${f}`));
         result.warnings.push(...gates.warnings.map((w) => `${name}: ${w}`));

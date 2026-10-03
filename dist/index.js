@@ -12,3 +12,4 @@ export { capTrainingWeights, isReal, ProvenanceError, validateProvenance } from 
 export { mmrSelect, retrieveFromSeeds, seedStats } from "./retrieval.js";
 export { realHardNegatives, selectForReview, verifyBatch } from "./hardnegatives.js";
 export { checkSliceAxes, coverageReport, defineAxes } from "./coverage.js";
+export { monitorWindow } from "./monitor.js";

@@ -78,6 +78,8 @@ export interface DesignSummary {
   allocation: { method: DesignOptions['allocation']['method']; minExpectedPositives?: number; minShare?: number; priorRates?: Record<string, number> };
   /** Strata that could not reach minExpectedPositives even when taken whole, and similar notes. */
   warnings: string[];
+  /** Small strata merged before sampling (mergeSmallStrata): the merged stratum and its original cells. */
+  merged: Array<{ name: string; from: string[] }>;
   scoringModel: string;
   seed: number;
   /** Frame items removed because their group already had one. */
@@ -91,6 +93,13 @@ export interface DesignOptions {
   scoreBands: readonly number[];
   /** Cross strata with signals.slice (default false). */
   bySlice?: boolean;
+  /**
+   * Merge strata too small to give 2 calibration and 2 test items into their closest neighbour -
+   * an adjacent score band with the same rule firing and slice, else the same band in another slice,
+   * else the other rule-firing value (default true; false throws instead). Decided from frame counts
+   * alone, before sampling, so the design stays a valid stratified sample (collapsed strata).
+   */
+  mergeSmallStrata?: boolean;
   allocation: {
     total: number;
     method: 'proportional' | 'manual' | 'expected-positives';
@@ -131,7 +140,7 @@ function roundWithin(targets: number[], lo: number[], hi: number[], total: numbe
 }
 
 export function designSample(options: DesignOptions): { designId: string; records: ExampleRecord[]; design: DesignSummary } {
-  const { frame, scoreBands, bySlice = false, allocation, minPerStratum = 30, roleSplit = { train: 0.5, calibration: 0.25, test: 0.25 }, scoringModel, seed } = options;
+  const { frame, scoreBands, bySlice = false, mergeSmallStrata = true, allocation, minPerStratum = 30, roleSplit = { train: 0.5, calibration: 0.25, test: 0.25 }, scoringModel, seed } = options;
   if (!frame.length) throw new Error('the frame is empty');
   if (!scoreBands.every((q, i) => q > 0 && q < 1 && (i === 0 || q < scoreBands[i - 1]))) throw new Error('scoreBands must be descending quantiles strictly between 0 and 1');
   const splitTotal = roleSplit.train + roleSplit.calibration + roleSplit.test;
@@ -143,7 +152,7 @@ export function designSample(options: DesignOptions): { designId: string; record
     if (ids.has(f.id)) throw new Error(`duplicate frame id ${f.id}`);
     ids.add(f.id);
   }
-  const designId = stableId('design', { ids: frame.map((f) => f.id), scoreBands, bySlice, allocation, minPerStratum, roleSplit, scoringModel, seed });
+  const designId = stableId('design', { ids: frame.map((f) => f.id), scoreBands, bySlice, mergeSmallStrata, allocation, minPerStratum, roleSplit, scoringModel, seed });
   const rand = seededRandom(seed);
 
   // 1. One item per group, chosen at random.
@@ -157,9 +166,52 @@ export function designSample(options: DesignOptions): { designId: string; record
   const cuts = scoreBands.map((q) => weightedQuantile(scores, scores.map(() => 1), q));
   const bandOf = (s: number) => { let k = 0; while (k < cuts.length && s < cuts[k]) k++; return k; };
   const bandRange = (k: number): [number, number] => [k < cuts.length ? cuts[k] : -Infinity, k === 0 ? Infinity : cuts[k - 1]];
-  const nameOf = (f: FrameItem) => `${f.signals.ruleFires ? 'rule' : 'no_rule'}|band${bandOf(f.signals.score)}${bySlice ? `|${f.signals.slice ?? ''}` : ''}`;
-  const strata = new Map<string, FrameItem[]>();
-  for (const f of items) (strata.get(nameOf(f)) ?? strata.set(nameOf(f), []).get(nameOf(f))!).push(f);
+  // Cells: rule firing × band (× slice). `from` lists the original cells a merged cell holds.
+  type Cell = { rule: boolean; bands: number[]; slice: string; items: FrameItem[]; name: string; from: string[] };
+  const nameFor = (rule: boolean, bands: number[], slice: string) => {
+    const lo = Math.min(...bands), hi = Math.max(...bands);
+    return `${rule ? 'rule' : 'no_rule'}|band${lo === hi ? lo : `${lo}-${hi}`}${bySlice ? `|${slice}` : ''}`;
+  };
+  let cells: Cell[] = [];
+  for (const f of items) {
+    const rule = f.signals.ruleFires, band = bandOf(f.signals.score), slice = bySlice ? f.signals.slice ?? '' : '';
+    let c = cells.find((x) => x.rule === rule && x.bands[0] === band && x.slice === slice);
+    if (!c) cells.push((c = { rule, bands: [band], slice, items: [], name: nameFor(rule, [band], slice), from: [nameFor(rule, [band], slice)] }));
+    c.items.push(f);
+  }
+  // The smallest stratum that can give 2 calibration and 2 test items when taken whole.
+  let minViable = 4;
+  while (Math.round(minViable * roleSplit.calibration) < 2 || Math.round(minViable * roleSplit.test) < 2) minViable++;
+  if (mergeSmallStrata) {
+    const adjacent = (a: Cell, b: Cell) => Math.min(...b.bands) === Math.max(...a.bands) + 1 || Math.min(...a.bands) === Math.max(...b.bands) + 1;
+    const overlap = (a: Cell, b: Cell) => a.bands.some((k) => b.bands.includes(k));
+    const bySize = (a: Cell, b: Cell) => a.items.length - b.items.length || a.name.localeCompare(b.name);
+    for (;;) {
+      const small = cells.filter((c) => c.items.length < minViable).sort(bySize)[0];
+      if (!small) break;
+      const others = cells.filter((c) => c !== small);
+      if (!others.length) throw new Error(`the frame has ${small.items.length} items after deduplication; a design needs at least ${minViable}`);
+      const tiers: Array<(c: Cell) => boolean> = [
+        (c) => c.rule === small.rule && c.slice === small.slice && adjacent(small, c), // neighbouring band
+        (c) => c.rule === small.rule && overlap(small, c), // same band, another slice
+        (c) => c.slice === small.slice && overlap(small, c), // same band, other rule firing
+        () => true,
+      ];
+      const into = tiers.map((t) => others.filter(t)).find((x) => x.length)!.sort(bySize)[0];
+      const sameKind = into.rule === small.rule && into.slice === small.slice;
+      const bands = [...new Set([...into.bands, ...small.bands])].sort((a, b) => a - b);
+      cells = [...others.filter((c) => c !== into), {
+        rule: into.rule, slice: into.slice, bands, items: [...into.items, ...small.items],
+        name: sameKind ? nameFor(into.rule, bands, into.slice) : `${into.name}+${small.name}`,
+        from: [...into.from, ...small.from],
+      }];
+    }
+  } else {
+    const small = cells.filter((c) => c.items.length < minViable);
+    if (small.length) throw new Error(`strata ${small.map((c) => `${c.name} (N = ${c.items.length})`).join(', ')} are too small for 2 calibration and 2 test items; set mergeSmallStrata or use fewer score bands`);
+  }
+  const merged = cells.filter((c) => c.from.length > 1).map((c) => ({ name: c.name, from: [...c.from].sort() }));
+  const strata = new Map<string, FrameItem[]>(cells.map((c) => [c.name, c.items]));
   const names = [...strata.keys()].sort();
   const N = names.map((h) => strata.get(h)!.length);
 
@@ -235,14 +287,15 @@ export function designSample(options: DesignOptions): { designId: string; record
       const source: Source = { kind: 'sampled', designId, stratum: name, inclusionProb: counts[role] / N[i], stratumSize: N[i] };
       records.push({ id: f.id, text: f.text, group: f.group, role, source, labels: {} });
     });
-    const band = bandOf(strata.get(name)![0].signals.score);
+    const bandsIn = strata.get(name)!.map((f) => bandOf(f.signals.score));
+    const range: [number, number] = [bandRange(Math.max(...bandsIn))[0], bandRange(Math.min(...bandsIn))[1]];
     return {
-      name, N: N[i], n: n[i], pi: n[i] / N[i], roles: counts, band: bandRange(band),
+      name, N: N[i], n: n[i], pi: n[i] / N[i], roles: counts, band: range,
       ...(rates ? { priorRate: rates[i], expectedCalibrationPositives: rates[i] * nCal } : {}),
     };
   });
   const summary: DesignSummary = {
-    designId, scoringModel, seed, duplicatesRemoved, strata: table, warnings,
+    designId, scoringModel, seed, duplicatesRemoved, strata: table, warnings, merged,
     allocation: { method: allocation.method, ...(rates ? { minExpectedPositives: minExpected, minShare, priorRates: Object.fromEntries(names.map((h, i) => [h, rates![i]])) } : {}) },
   };
   return { designId, records, design: summary };

@@ -59,9 +59,32 @@ export type HeadPolicy = {
     minPositiveGroups?: number;
     /** Gate, when a baseline is supplied: must catch something the baseline misses (default true). */
     mustBeatBaseline?: boolean;
+    /**
+     * Per-slice recall gate on the test split (slices from trainHeads `slices`). A slice whose recall
+     * upper bound is below `target` (default targetRecall) FAILS - it is demonstrably missing its
+     * target; one whose lower bound is below it gets a warning (can't be confirmed); slices with
+     * fewer than minPositives (effective) positives get an "insufficient data" warning. Bounds are
+     * Bonferroni-corrected across the slices checked, at 95% overall.
+     */
+    sliceGate?: {
+        target?: number;
+        minPositives?: number;
+        fields?: readonly string[];
+    };
 } | {
     kind: 'precision';
     targetPrecision: number;
+    /**
+     * 'heuristic' (default): the threshold is targetPrecision on the calibrated probability - only as
+     * good as the calibrator; in simulation a misspecified Platt fit missed the target in 95% of runs.
+     * 'design': solvers' designPrecisionThreshold on sampled calibration records - the loosest
+     * candidate whose precision lower bound reaches the target (candidates from training scores).
+     */
+    mode?: 'heuristic' | 'design';
+    /** design mode: the precision bound fails with probability at most delta (default 0.05). */
+    delta?: number;
+    /** design mode: 'linearised' (default; approximate) or 'exact' (valid but rarely feasible: it must allow for unseen false positives in every stratum). */
+    designMethod?: 'exact' | 'linearised';
     /** Gate: minimum test examples the head must fire on for its precision to mean anything (default none; warns below 30). */
     minFired?: number;
 };

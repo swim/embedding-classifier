@@ -32,6 +32,8 @@ export interface DesignEstimate {
     ci95: [number, number];
     /** Rao-Wu bootstrap percentile interval. */
     bootstrap_ci95?: [number, number];
+    /** Kish effective number of units in the estimate's denominator (e.g. positives, for recall). */
+    effective_n?: number;
 }
 /** Design-based (Horvitz-Thompson) estimates from a stratified probability sample. Approximate. */
 export interface DesignEvaluation {
@@ -83,6 +85,16 @@ export interface HeadEvaluation {
     certified: CertifiedBounds;
     /** Present when the test set is a probability sample: recall, precision and false alarms above are these estimates. */
     design?: DesignEvaluation;
+    /**
+     * Cox's recalibration test on the test split (weights as for ECE): y ~ a + b·logit(p), H0 a = 0, b = 1.
+     * Unlike ECE it has a stated error rate and stays sensitive for rare classes.
+     */
+    calibration_test?: {
+        intercept: number;
+        slope: number;
+        lr: number;
+        p_value: number;
+    };
     /** Recall heads: what the shipped threshold guarantees from calibration, and why. */
     guarantee?: Guarantee;
     sufficiency?: Sufficiency;

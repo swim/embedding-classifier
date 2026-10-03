@@ -43,6 +43,7 @@ export function reportMarkdown(artifact: ClassifierArtifact, options: { title?: 
       `| false-alarm rate | ${f3(ev.false_alarm_rate)} |`,
       `| precision (prevalence-weighted) | ${f3(ev.precision_prevalence_weighted)} |`,
       `| ECE (prevalence-weighted) | ${f4(ev.ece_prevalence_weighted)} |`,
+      ...(ev.calibration_test ? [`| calibration test (Cox): intercept / slope, p | ${f3(ev.calibration_test.intercept)} / ${f3(ev.calibration_test.slope)}, p = ${typeof ev.calibration_test.p_value === 'number' ? ev.calibration_test.p_value.toExponential(2) : 'n/a'} |`] : []),
     );
     const c = ev.certified;
     if (c) {
@@ -56,7 +57,11 @@ export function reportMarkdown(artifact: ClassifierArtifact, options: { title?: 
     if (c) lines.push('', `Certified bounds hold together with probability ${f3(1 - c.delta)}, whatever chose the threshold.`);
     const g = ev.guarantee;
     if (g) {
-      const what = g.kind === 'pac' ? `recall ≥ ${f3(1 - g.alpha)} with probability ${f3(1 - (g.delta ?? 0))}` : g.kind === 'expected' ? `recall ≥ ${f3(1 - g.alpha)} in expectation over calibration draws` : 'nothing (no conformal guarantee)';
+      const metric = g.metric ?? 'recall';
+      const what = g.kind === 'pac' ? `recall ≥ ${f3(1 - g.alpha)} with probability ${f3(1 - (g.delta ?? 0))}`
+        : g.kind === 'expected' ? `recall ≥ ${f3(1 - g.alpha)} in expectation over calibration draws`
+        : g.kind === 'design-exact' || g.kind === 'design-approximate' ? `${metric} ≥ ${f3(1 - g.alpha)} with probability ${f3(1 - (g.delta ?? 0))} (${g.kind === 'design-exact' ? 'exact' : 'approximate'}, from a stratified sample)`
+        : 'nothing (no stated guarantee)';
       const budgets = [g.false_alarm !== undefined ? `calibration false alarms ≤ ${g.false_alarm}` : '', g.background_rate !== undefined ? `background rate ≤ ${g.background_rate}` : ''].filter(Boolean);
       lines.push('', `Threshold mode **${g.mode}**${ev.sufficiency ? ` (used: ${ev.sufficiency.chosen})` : ''}: guarantees ${what}${budgets.length ? `, with ${budgets.join(' and ')}` : ''}.`);
       const s = ev.sufficiency;

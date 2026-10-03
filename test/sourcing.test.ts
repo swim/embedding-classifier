@@ -74,7 +74,7 @@ test('designSample: reproducible, floored, π = 1 strata, role minimums', () => 
   const whole = small.design.strata.find((s) => s.name.startsWith('rule|'))!;
   assert.deepEqual([whole.N, whole.n, whole.pi], [12, 12, 1]);
   assert.throws(() => designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 20, method: 'proportional' }, scoringModel: 'm', seed: 1 }), /below the \d+ that minPerStratum 30 needs/);
-  assert.throws(() => designSample({ frame: frame.slice(0, 30), scoreBands: [0.95, 0.8], allocation: { total: 30, method: 'proportional' }, minPerStratum: 4, scoringModel: 'm', seed: 1 }), /each needs at least 2/);
+  assert.throws(() => designSample({ frame: frame.slice(0, 30), scoreBands: [0.95, 0.8], allocation: { total: 30, method: 'proportional' }, minPerStratum: 4, mergeSmallStrata: false, scoringModel: 'm', seed: 1 }), /too small for 2 calibration and 2 test items/);
   const plain = frame.slice(0, 300).map((f) => ({ ...f, signals: { ...f.signals, ruleFires: false } }));
   const dup = [...plain, { ...plain[0], id: 'dup' }];
   assert.equal(designSample({ frame: dup, scoreBands: [0.8], allocation: { total: 100, method: 'proportional' }, scoringModel: 'm', seed: 1 }).design.duplicatesRemoved, 1);
@@ -347,4 +347,101 @@ test('allocation coverage: high-score-heavy sampling under-covers; sized proport
   const sized = run({ total: 5200, method: 'expected-positives', prior }, 80);
   assert.ok(sized.feasible >= 0.9 * sized.runs, `sized: feasible ${sized.feasible}/${sized.runs}`);
   assert.ok(sized.fails <= 0.05 * sized.runs + 3 * Math.sqrt(sized.runs * 0.05 * 0.95), `sized: ${sized.fails} failures in ${sized.runs}`);
+});
+
+test('small strata are merged before sampling: neighbouring band first, then across rule firing; estimates stay unbiased', () => {
+  const base = frame.slice(0, 2000).map((f) => ({ ...f, signals: { ...f.signals, ruleFires: false } }));
+  // Three rule-firing items with top scores: a stratum of 3 can't give 2 calibration and 2 test items.
+  const tiny = [0.999, 0.998, 0.997].map((score, i): FrameItem => ({ id: `t${i}`, text: 't', group: `t${i}`, signals: { ruleFires: true, score } }));
+  const d = designSample({ frame: [...base, ...tiny], scoreBands: [0.95, 0.8], allocation: { total: 600, method: 'proportional' }, scoringModel: 'm', seed: 2 });
+  assert.deepEqual(d.design.merged, [{ name: 'no_rule|band0+rule|band0', from: ['no_rule|band0', 'rule|band0'] }], 'no other rule-firing cell exists, so it joins the same band');
+  assert.ok(d.design.strata.every((s) => s.roles.calibration >= 2 && s.roles.test >= 2));
+  // Uniform scores; rule fires on 140 items of the middle band and the 3 top items: the small
+  // rule|band0 joins its neighbouring band with the same rule firing.
+  const uniform = Array.from({ length: 1000 }, (_, i): FrameItem => ({ id: `u${i}`, text: 'u', group: `u${i}`, signals: { ruleFires: i >= 830 && i < 940, score: i / 1000 } }));
+  const d2 = designSample({ frame: [...uniform, ...tiny], scoreBands: [0.95, 0.8], allocation: { total: 400, method: 'proportional' }, scoringModel: 'm', seed: 2 });
+  assert.deepEqual(d2.design.merged, [{ name: 'rule|band0-1', from: ['rule|band0', 'rule|band1'] }]);
+  assert.throws(() => designSample({ frame: tiny, scoreBands: [0.95], allocation: { total: 3, method: 'proportional' }, scoringModel: 'm', seed: 1 }), /needs at least 8|a design needs at least/);
+
+  // Merging is decided from frame counts only, so HT estimates remain unbiased.
+  const withTiny = [...base, ...tiny.map((t) => ({ ...t, x: [0], truth: 1 as const }))] as Array<FrameItem & { truth: 0 | 1 }>;
+  const truth = new Map(withTiny.map((f) => [f.id, (f as { truth?: 0 | 1 }).truth ?? byId.get(f.id)!.truth]));
+  const prev = withTiny.filter((f) => truth.get(f.id)).length / withTiny.length;
+  let est = 0;
+  const runs = 300;
+  for (let r = 0; r < runs; r++) {
+    const test = designSample({ frame: withTiny, scoreBands: [0.95, 0.8], allocation: { total: 400, method: 'proportional' }, scoringModel: 'm', seed: 50 + r }).records.filter((x) => x.role === 'test');
+    const dd = designOf(test);
+    const y = test.map((x) => truth.get(x.id)!);
+    est += htTotal(y, dd.inclusionProbs) / htTotal(y.map(() => 1), dd.inclusionProbs);
+  }
+  assert.ok(Math.abs(est / runs - prev) < 0.004, `prevalence ${est / runs} vs ${prev}`);
+});
+
+test('trainHeads: a precision head in design mode states a precision guarantee from the sampled calibration set', () => {
+  const sampled = design(7, 3000).records;
+  const { records } = label(sampled);
+  const X = records.map((r) => byId.get(r.id)!.x);
+  const split = records.map((r) => r.role as Split);
+  const y = records.map((r) => r.labels.h as 0 | 1);
+  const r = trainHeads({ X, split, records, heads: [{ name: 'h', y, policy: { kind: 'precision', targetPrecision: 0.6, mode: 'design' } }], seed: 1 });
+  const g = r.heads.h!.guarantee!;
+  assert.deepEqual([g.mode, g.kind, g.metric, g.method], ['design', 'design-approximate', 'precision', 'linearised'], r.failures.join('; '));
+  assert.ok(Math.abs(g.alpha - 0.4) < 1e-12);
+  assert.deepEqual(r.failures, [], r.failures.join('; '));
+  const ev = r.evaluation.h!;
+  assert.ok(ev.design!.precision!.ci95[1] >= 0.6, 'the test split does not contradict the guarantee');
+  const report = reportMarkdown({ version: 'v', created_at: '', embedding: { model_id: 't', dimensions: 8, normalize: false }, heads: r.heads, evaluation: r.evaluation });
+  assert.match(report, /precision ≥ 0\.600 with probability 0\.950 \(approximate, from a stratified sample\)/);
+  assert.throws(() => trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.06, policy: { kind: 'precision', targetPrecision: 0.6, mode: 'design' } }] }), /needs sampled calibration records/);
+});
+
+test('slice gate: fails a slice demonstrably below target, warns when it cannot be confirmed or is too small', async () => {
+  const { evaluateHead, gateHead } = await import('../src/index.ts');
+  const rand = seededRandom(4);
+  const build = (recallB: number, nPos: number, extraSlice = 0) => {
+    const p: number[] = [], y: number[] = [], slice: string[] = [];
+    for (let i = 0; i < nPos; i++) { const b = rand() < 0.3; y.push(1); slice.push(b ? 'B' : 'A'); p.push(rand() < (b ? recallB : 0.95) ? 0.9 : 0.1); }
+    for (let i = 0; i < extraSlice; i++) { y.push(1); slice.push('C'); p.push(0.9); }
+    for (let i = 0; i < nPos * 5; i++) { y.push(0); slice.push(rand() < 0.3 ? 'B' : 'A'); p.push(rand() < 0.02 ? 0.9 : 0.05); }
+    return evaluateHead({ p, y, w: p.map(() => 1), threshold: 0.5, slices: { src: slice } });
+  };
+  const policy = { kind: 'recall' as const, targetRecall: 0.9, designRecall: 0.9, sliceGate: { minPositives: 10 } };
+  const bad = gateHead(policy, build(0.8, 1000), { maxEce: 1 });
+  assert.ok(bad.failures.some((f) => /^slice src=B: recall 0\.\d+ is below the target 0\.9/.test(f)), bad.failures.join('; '));
+  assert.ok(!bad.failures.some((f) => f.startsWith('test recall')), 'overall recall still passes - only the slice gate sees it');
+  const fine = gateHead(policy, build(0.95, 1000, 4), { maxEce: 1 });
+  assert.ok(!fine.failures.some((f) => f.startsWith('slice')), fine.failures.join('; '));
+  assert.ok(fine.warnings.some((w) => /slice src=C: only 4\.0 positives - too few to judge/.test(w)));
+  assert.ok(!gateHead({ ...policy, sliceGate: { fields: ['other'] } }, build(0.8, 1000), { maxEce: 1 }).failures.some((f) => f.startsWith('slice')), 'only the listed fields');
+
+  // Design-based slices on a sampled test set: same gate, effective positives.
+  const strata = Array.from({ length: 2000 }, (_, i) => (i % 2 ? 'h1' : 'h2'));
+  const yD = strata.map((_, i) => (i % 5 === 0 ? 1 : 0));
+  const sliceD = strata.map((_, i) => (i % 3 === 0 ? 'B' : 'A'));
+  const pD = yD.map((v, i) => (v && (sliceD[i] === 'A' || i % 4 !== 0) ? 0.9 : 0.1));
+  const evD = evaluateHead({ p: pD, y: yD, w: pD.map(() => 4), threshold: 0.5, slices: { src: sliceD }, design: { inclusionProbs: pD.map(() => 0.25), strata, stratumSizes: { h1: 4000, h2: 4000 }, replicates: 0 } });
+  assert.ok(evD.design!.slices['src=B'].effective_n! > 100);
+  const gD = gateHead(policy, evD, { maxEce: 1 });
+  assert.ok(gD.failures.some((f) => f.startsWith('slice src=B')), gD.failures.join('; '));
+});
+
+test('calibration gate: Cox test fails overconfident rare-class probabilities that ECE lets through', async () => {
+  const { evaluateHead, gateHead } = await import('../src/index.ts');
+  const rand = seededRandom(7);
+  const sig = (x: number) => 1 / (1 + Math.exp(-x));
+  const gauss = () => Math.sqrt(-2 * Math.log(rand() + 1e-300)) * Math.cos(2 * Math.PI * rand());
+  const sample = (slope: number) => {
+    const p: number[] = [], y: number[] = [];
+    for (let i = 0; i < 4000; i++) { const z = -4.5 + 1.5 * gauss(); y.push(rand() < sig(z) ? 1 : 0); p.push(sig(slope * (z + 4.5) - 4.5)); }
+    return evaluateHead({ p, y, w: p.map(() => 1), threshold: 0.5 });
+  };
+  const policy = { kind: 'precision' as const, targetPrecision: 0.01 };
+  const calibrated = sample(1), overconfident = sample(1.4);
+  assert.ok(calibrated.calibration_test!.p_value > 0.01);
+  assert.ok(Math.abs(calibrated.calibration_test!.slope - 1) < 0.2);
+  assert.ok(overconfident.ece_prevalence_weighted <= 0.05, 'ECE stays under its gate');
+  assert.ok(!gateHead(policy, overconfident).failures.some((f) => f.startsWith('ECE')));
+  assert.ok(gateHead(policy, overconfident, { calibrationAlpha: 0.01 }).failures.some((f) => /miscalibrated \(Cox test/.test(f)));
+  assert.ok(!gateHead(policy, calibrated, { calibrationAlpha: 0.01 }).failures.some((f) => /miscalibrated/.test(f)));
 });

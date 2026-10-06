@@ -21,8 +21,8 @@ export type HeadFeatures = {
 export interface ReferenceSet {
     /**
      * 'f32': row-major little-endian float32. 'int8': one signed byte per value with a per-row scale
-     * (value = byte × scale, then rounded to float32): about 4× smaller, with the same thresholds and
-     * false alarms in simulation (support-example sim-reference). Training scores with the decoded
+     * (value = byte × scale, then rounded to float32): about 4× smaller; cosine rankings barely move,
+     * so thresholds and false alarms are essentially unchanged. Training scores with the decoded
      * reference either way, so runtime reproduces evaluation exactly.
      */
     encoding: 'f32' | 'int8';
@@ -66,7 +66,7 @@ interface RuntimeReference {
 export declare function runtimeReference(ref: ReferenceSet): RuntimeReference;
 /** Features for one head at runtime; `sims` are the embedding's cosines to every reference row (computed once per message). */
 export declare function headFeatureVector(head: string, features: HeadFeatures, embedding: ArrayLike<number>, ref: RuntimeReference, sims: ArrayLike<number>): number[];
-/** Fold of a row (FNV-style hash of its key), as the research's cross-fitting. */
+/** Fold of a row (FNV-style hash of its key). */
 export declare function foldOf(key: string): number;
 export interface FeatureTraining {
     /** Training rows (indices into X), their labels and weights. */
@@ -90,6 +90,8 @@ export interface FittedFeatures {
     train: number[][];
     /** Full-reference features for any other embedding. */
     apply: (x: ArrayLike<number>) => number[];
+    /** Whether every fit stored in `features` converged (the stack's linear component). */
+    converged: boolean;
 }
 /**
  * Fits a head type's features. Out-of-fold for the training rows: the reference rows and models of

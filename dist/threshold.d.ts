@@ -32,14 +32,27 @@ export type HeadPolicy = {
     targetRecall: number;
     /** Heuristic threshold selection target on the calibration split (>= targetRecall). Required for `heuristic`, and as `auto`'s last resort. */
     designRecall?: number;
-    /** How the threshold is chosen (default `heuristic`). */
+    /**
+     * How the threshold is chosen. Default: the strongest guarantee the data supports - 'design' with
+     * sampled calibration records, else 'auto' (conformal) with no heuristic fallback (a head the data
+     * can't support fails its gates). 'heuristic' (no guarantee) only when set explicitly.
+     */
     mode?: ThresholdMode;
     /**
      * auto: when the calibration data supports no guarantee at all, use the heuristic threshold
-     * with an "inconclusive" warning (true, default) or fail the head (false - e.g. for
-     * safety-critical heads). Falling back from PAC to an expected guarantee is always allowed.
+     * with an "inconclusive" warning (true) or fail the head (false). Default: true when mode 'auto'
+     * is set explicitly, false when it is the default. Falling back from PAC to an expected guarantee
+     * is always allowed.
      */
     allowHeuristicFallback?: boolean;
+    /**
+     * When the calibration data can't support the mode's guarantee (too few labelled positives):
+     * 'fail' fails the head's gates (default for the default mode), 'heuristic' uses the heuristic
+     * threshold instead (needs designRecall), recorded as guarantee.fallback with kind 'none' and a
+     * warning saying how many effective calibration positives a guarantee would need. Per head, so a
+     * well-labelled head keeps its guarantee while a sparse one still gets a threshold.
+     */
+    fallback?: 'fail' | 'heuristic';
     /** design mode: the bound behind the guarantee (default 'exact'; see solvers' designRiskThreshold). */
     designMethod?: 'exact' | 'linearised' | 'bootstrap';
     /**
@@ -75,12 +88,19 @@ export type HeadPolicy = {
     kind: 'precision';
     targetPrecision: number;
     /**
-     * 'heuristic' (default): the threshold is targetPrecision on the calibrated probability - only as
-     * good as the calibrator; in simulation a misspecified Platt fit missed the target in 95% of runs.
-     * 'design': solvers' designPrecisionThreshold on sampled calibration records - the loosest
-     * candidate whose precision lower bound reaches the target (candidates from training scores).
+     * 'design' (default with sampled calibration records): solvers' designPrecisionThreshold - the
+     * loosest candidate whose precision lower bound reaches the target (candidates from training scores).
+     * 'heuristic': the threshold is targetPrecision on the calibrated probability - only as good as the
+     * calibrator (in simulation a misspecified Platt fit missed the target in 95% of runs), with no
+     * guarantee; it must be set explicitly. Without records and without it, the head fails its gates.
      */
     mode?: 'heuristic' | 'design';
+    /**
+     * When the calibration data can't support the design guarantee, or there are no sampled records:
+     * 'fail' (default) fails the head's gates; 'heuristic' uses targetPrecision as the threshold,
+     * recorded as guarantee.fallback with kind 'none' and a warning.
+     */
+    fallback?: 'fail' | 'heuristic';
     /** design mode: the precision bound fails with probability at most delta (default 0.05). */
     delta?: number;
     /** design mode: 'linearised' (default; approximate) or 'exact' (valid but rarely feasible: it must allow for unseen false positives in every stratum). */

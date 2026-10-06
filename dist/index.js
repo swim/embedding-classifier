@@ -3,7 +3,7 @@ export { decide, missingPolicyHeads, settleWithRules } from "./decide.js";
 export { budgetThreshold, falseAlarmCap, nextUp, pickThreshold } from "./threshold.js";
 export { evaluateHead } from "./evaluate.js";
 export { gateHead } from "./gates.js";
-export { assertRoundTrip, SPLITS, trainHeads } from "./train.js";
+export { assertRoundTrip, buildArtifact, SPLITS, trainHeads } from "./train.js";
 export { loadOrder, publishPlan, refuseToServe } from "./lifecycle.js";
 export { reportMarkdown } from "./report.js";
 export { conformalThreshold, groupScores, THRESHOLD_MODES } from "./conformal.js";

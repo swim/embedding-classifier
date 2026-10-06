@@ -26,13 +26,24 @@ const allFinite = (v) => Array.isArray(v) && v.every(isFiniteNumber);
  * Validates an artifact loaded from storage; throws with a specific reason if it's unusable.
  * Checks values, not just shape: a corrupted or hand-edited artifact must fail loudly here rather
  * than score NaN at runtime (which decide() would otherwise read as "no decision").
- * Pass `heads` to reject head names the caller doesn't know how to act on.
+ * Pass `heads` to reject head names the caller doesn't know how to act on, and `mode: 'enforce'` when
+ * the decisions will act: the artifact's gates must then have passed (buildArtifact records them).
  */
 export function validateArtifact(raw, options = {}) {
     const a = raw;
     if (!a || typeof a !== 'object' || typeof a.version !== 'string' || !a.embedding || !a.heads || typeof a.heads !== 'object' || Array.isArray(a.heads)) {
         throw new Error('not a classifier artifact');
     }
+    // Gates: recorded consistently, and passed before anything may act on the artifact ('enforce').
+    if (a.gates !== undefined) {
+        const g = a.gates;
+        if (typeof g.passed !== 'boolean' || !Array.isArray(g.failures) || !g.failures.every((f) => typeof f === 'string'))
+            throw new Error('artifact gates are malformed');
+        if (g.passed && g.failures.length)
+            throw new Error(`artifact gates say passed but record ${g.failures.length} failure(s)`);
+    }
+    if (options.mode === 'enforce' && a.gates?.passed !== true)
+        throw new Error('refusing to enforce an artifact whose gates did not pass (or were not recorded): serve it in shadow mode, or retrain');
     const dims = a.embedding.dimensions;
     if (!Number.isInteger(dims) || dims < 1)
         throw new Error(`embedding dimensions must be a positive integer, got ${dims}`);
@@ -60,6 +71,12 @@ export function validateArtifact(raw, options = {}) {
             for (let i = 1; i < x.length; i++)
                 if (x[i] < x[i - 1])
                     throw new Error(`head ${name} has isotonic x values that are not sorted`);
+            // A calibrator maps probabilities to probabilities, monotonically: anything else can't come from fitIsotonic.
+            if (!x.every((v) => v >= 0 && v <= 1) || !y.every((v) => v >= 0 && v <= 1))
+                throw new Error(`head ${name} has an isotonic table outside [0, 1]`);
+            for (let i = 1; i < y.length; i++)
+                if (y[i] < y[i - 1])
+                    throw new Error(`head ${name} has isotonic y values that decrease`);
         }
         else {
             throw new Error(`head ${name} has unknown calibration ${cal?.method}`);
@@ -137,6 +154,8 @@ function validateGuarantee(name, g) {
     const allowed = { heuristic: ['none'], 'conformal-expected': ['expected', 'none'], 'conformal-pac': ['pac', 'none'], auto: ['pac', 'expected', 'none'], design: ['design-exact', 'design-approximate', 'none'] };
     if (!allowed[g.mode].includes(g.kind))
         throw new Error(`head ${name}: mode ${g.mode} cannot give a ${g.kind} guarantee`);
+    if (g.fallback !== undefined && (g.fallback !== 'heuristic' || g.kind !== 'none'))
+        throw new Error(`head ${name}: a fallback guarantee must be 'heuristic' with kind none`);
     const withDelta = g.kind === 'pac' || g.kind === 'design-exact' || g.kind === 'design-approximate';
     if (withDelta && !isRate(g.delta))
         throw new Error(`head ${name}: a ${g.kind} guarantee needs delta in (0, 1)`);

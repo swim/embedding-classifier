@@ -1,6 +1,6 @@
 import { type DesignSummary } from './design.ts';
 import { type ExampleRecord, type ProvenanceCode, type ProvenanceOptions, type WeightCaps, type WeightCapSummary } from './records.ts';
-import { type ClassifierArtifact, type HeadSpec } from './artifact.ts';
+import { type ClassifierArtifact, type EmbeddingSpec, type HeadSpec } from './artifact.ts';
 import { type HeadEvaluation } from './evaluate.ts';
 import { type HeadType, type ReferenceSet } from './heads.ts';
 import { type HeadPolicy } from './threshold.ts';
@@ -151,13 +151,18 @@ export interface TrainInput<H extends string> {
     foldKeys?: readonly string[];
     /**
      * type 'auto': a knn or stack head is chosen only when its cross-validated cost is below the linear
-     * head's × (1 − autoMargin) (default 0.2), then the cheaper of the two. In the research (66 heads ×
-     * seeds, four datasets) no margin left linear in 49 of 66 cases and lost to it in 10; a 20% margin
-     * kept nearly all the gain on recall heads, raised recall on precision heads and lost in 6 (30%
-     * behaved the same; absolute margins of 0.01 or more threw the gains away).
+     * head's × (1 − autoMargin) (default 0.2), then the cheaper of the two. Cross-validated costs on a
+     * small training split are noisy; without a margin, near-ties often pick a non-linear head that does
+     * worse on new traffic. A relative margin keeps the clear wins and drops the near-ties.
      */
     autoMargin?: number;
-    /** Encoding of the knn reference (default 'f32'): 'int8' is about 4× smaller, same results in simulation. */
+    /**
+     * A fit that stopped short of its tolerance (the head's logistic model, a stack's linear component,
+     * or the Platt calibrator - the likeliest, on a small calibration split the scores separate) is a
+     * warning by default; true makes it a gate failure. result.convergence records every head's fits.
+     */
+    requireConvergence?: boolean;
+    /** Encoding of the knn reference (default 'f32'): 'int8' is about 4× smaller, with essentially the same results. */
     referenceEncoding?: 'f32' | 'int8';
     log?: (line: string) => void;
 }
@@ -195,6 +200,11 @@ export interface TrainResult<H extends string> {
     provenance?: ProvenanceSummary;
     /** Training embeddings for knn and stack heads - store as artifact.reference (scoreEmbedding needs it). */
     reference?: ReferenceSet;
+    /** Whether each head's fits converged: its model (and a stack's linear component), and its Platt calibrator. */
+    convergence: Partial<Record<H, {
+        model: boolean;
+        calibration: boolean;
+    }>>;
     /** Heads trained with type 'auto': each type's cross-validated cost and the choice - store as artifact.training.head_choice. */
     headChoice: Partial<Record<H, HeadChoice>>;
     /** With sampled records: the designs and each head's estimator - store as artifact.training.design. */
@@ -219,3 +229,14 @@ export declare function trainHeads<H extends string>(input: TrainInput<H>): Trai
  * reproduces the evaluated test probabilities exactly - so what was evaluated is what will run.
  */
 export declare function assertRoundTrip<H extends string>(artifact: ClassifierArtifact<H>, X: ReadonlyArray<ArrayLike<number>>, testProbabilities: TrainResult<H>['testProbabilities'], sample?: number): void;
+/**
+ * The artifact for a training result, with its gates taken from the result (passed exactly when no
+ * gate failed), so they are never set by hand. Also records the reference, head choices, convergence,
+ * provenance, design and weak-label summaries. Serve it through validateArtifact(raw, { mode }).
+ */
+export declare function buildArtifact<H extends string>(result: TrainResult<H>, options: {
+    version: string;
+    embedding: EmbeddingSpec;
+    createdAt?: string;
+    training?: Record<string, unknown>;
+}): ClassifierArtifact<H>;

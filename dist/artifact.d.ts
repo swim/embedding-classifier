@@ -71,10 +71,12 @@ export declare function headProbability(spec: HeadSpec, embedding: ArrayLike<num
  * Validates an artifact loaded from storage; throws with a specific reason if it's unusable.
  * Checks values, not just shape: a corrupted or hand-edited artifact must fail loudly here rather
  * than score NaN at runtime (which decide() would otherwise read as "no decision").
- * Pass `heads` to reject head names the caller doesn't know how to act on.
+ * Pass `heads` to reject head names the caller doesn't know how to act on, and `mode: 'enforce'` when
+ * the decisions will act: the artifact's gates must then have passed (buildArtifact records them).
  */
 export declare function validateArtifact<H extends string = string>(raw: unknown, options?: {
     heads?: readonly H[];
+    mode?: 'shadow' | 'enforce';
 }): ClassifierArtifact<H>;
 /** Calibrated probability for every head in the artifact. */
 export declare function scoreEmbedding<H extends string>(artifact: ClassifierArtifact<H>, embedding: ArrayLike<number>): Scores<H>;

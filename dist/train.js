@@ -41,7 +41,7 @@ function indicesBySplit(split, y) {
     return idx;
 }
 export function trainHeads(input) {
-    const { X, split, C = 1, autoMargin = 0.2, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, groups, slices, background, records, seed = 0, log = () => { } } = input;
+    const { X, split, C = 1, autoMargin = 0.2, requireConvergence = false, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, groups, slices, background, records, seed = 0, log = () => { } } = input;
     checkLength('split', split, X.length);
     split.forEach((s, i) => {
         if (!SPLITS.includes(s))
@@ -58,7 +58,7 @@ export function trainHeads(input) {
         throw new Error('autoMargin must be in [0, 1)');
     if (reviewEpsilon !== undefined && !(reviewEpsilon > 0 && reviewEpsilon < 1))
         throw new Error('reviewEpsilon must be strictly between 0 and 1');
-    const result = { heads: {}, evaluation: {}, failures: [], warnings: [], testProbabilities: {}, weakLabels: {}, headChoice: {} };
+    const result = { heads: {}, evaluation: {}, failures: [], warnings: [], testProbabilities: {}, weakLabels: {}, headChoice: {}, convergence: {} };
     checkLength('foldKeys', input.foldKeys, X.length);
     const foldKey = (i) => input.foldKeys?.[i] ?? groups?.[i] ?? `#${i}`;
     // Provenance: validate every record, drop P5 near-duplicates from training, record overrides.
@@ -242,9 +242,22 @@ export function trainHeads(input) {
         // The calibrator sees the rows the dismissal rules leave to the classifier; cleared rows score 0.
         const kept = idx.calibration.map((i) => !cleared(i));
         const keep = (v) => v.filter((_, j) => kept[j]);
-        const calibration = method === 'platt'
-            ? { method: 'platt', ...fitPlatt(keep(calLogits), keep(yCal), keep(wCal)) }
-            : { method: 'isotonic', ...fitIsotonic(keep(calLogits).map(sigmoid), keep(yCal), keep(wCal), { yMin: 0, yMax: 1 }) };
+        let calibrationConverged = true;
+        let calibration;
+        if (method === 'platt') {
+            const { a, c, converged } = fitPlatt(keep(calLogits), keep(yCal), keep(wCal));
+            calibration = { method: 'platt', a, c };
+            calibrationConverged = converged;
+        }
+        else
+            calibration = { method: 'isotonic', ...fitIsotonic(keep(calLogits).map(sigmoid), keep(yCal), keep(wCal), { yMin: 0, yMax: 1 }) };
+        // Convergence: a fit that stopped short of its tolerance is reported (a failure with requireConvergence).
+        const modelConverged = model.converged && (fitted?.converged ?? true);
+        result.convergence[name] = { model: modelConverged, calibration: calibrationConverged };
+        for (const [what, ok] of [['logistic model', modelConverged], ['Platt calibrator (the calibration scores may separate the classes)', calibrationConverged]]) {
+            if (!ok)
+                (requireConvergence ? result.failures : result.warnings).push(`${name}: the ${what} did not converge`);
+        }
         const pCal = calLogits.map((z, j) => (kept[j] ? calibrate(calibration, z) : 0));
         const budget = background?.maxRate[name];
         const backgroundP = background && budget !== undefined ? background.X.map((x, j) => (dismissal?.background?.[j] ? 0 : score(x))) : null;
@@ -264,7 +277,15 @@ export function trainHeads(input) {
         const backgroundRanks = [];
         if (backgroundP && budget !== undefined && Math.floor(budget * backgroundP.length) < backgroundP.length)
             backgroundRanks.push(Math.floor(budget * backgroundP.length));
-        const mode = policy.kind === 'recall' ? policy.mode ?? 'heuristic' : 'heuristic';
+        // Default: the strongest guarantee the data supports - 'design' with sampled calibration records,
+        // else 'auto' (conformal) without the silent heuristic fallback. 'heuristic' only when chosen.
+        const mode = policy.kind === 'recall' ? policy.mode ?? (calDesign ? 'design' : 'auto') : 'heuristic';
+        const precisionMode = policy.kind === 'precision' ? policy.mode ?? (calDesign ? 'design' : undefined) : undefined;
+        const allowHeuristic = policy.kind === 'recall'
+            ? policy.allowHeuristicFallback ?? (policy.fallback !== undefined ? policy.fallback === 'heuristic' : policy.mode !== undefined)
+            : false;
+        if (policy.kind === 'recall' && policy.fallback === 'heuristic' && policy.designRecall === undefined)
+            throw new Error(`${name}: fallback 'heuristic' needs designRecall (the heuristic threshold's target)`);
         if (unequal && (mode === 'conformal-expected' || mode === 'conformal-pac' || mode === 'auto' || reviewEpsilon !== undefined)) {
             throw new Error(`${name}: the calibration records have unequal inclusion probabilities, so they aren't exchangeable and conformal guarantees${reviewEpsilon !== undefined ? ' (including reviewEpsilon)' : ''} don't hold - use mode 'design'`);
         }
@@ -294,6 +315,12 @@ export function trainHeads(input) {
                 }
                 log(`${name}: design threshold ${threshold} (${res.guarantee}, ${designMethod}, Kish effective positives ${res.nEff.toFixed(1)})`);
             }
+            else if (policy.fallback === 'heuristic') {
+                // Too little evidence for the guarantee, and the policy chose a heuristic threshold for that case.
+                threshold = heuristic();
+                guarantee = { mode, kind: 'none', alpha: 1 - policy.targetRecall, fallback: 'heuristic' };
+                result.warnings.push(`${name}: design: ${res.reason}; heuristic threshold (fallback), no guarantee - a guarantee needs at least ${minimumSamples(1 - policy.targetRecall, delta)} effective calibration positives with no misses (have ${res.nEff.toFixed(1)})`);
+            }
             else {
                 fails.push(`design: ${res.reason}`);
                 threshold = nextUp(1); // never fires: no threshold is substituted silently
@@ -311,7 +338,7 @@ export function trainHeads(input) {
             }
             if (backgroundP && budget !== undefined)
                 constraints.push({ name: 'background', scores: backgroundP, maxRate: budget });
-            const sel = conformalThreshold({ mode: mode, targetRecall: policy.targetRecall, delta, positives, constraints, heuristicAvailable: policy.designRecall !== undefined, allowHeuristic: policy.allowHeuristicFallback });
+            const sel = conformalThreshold({ mode: mode, targetRecall: policy.targetRecall, delta, positives, constraints, heuristicAvailable: policy.designRecall !== undefined, allowHeuristic });
             if (backgroundP && budget !== undefined) {
                 for (const d of [undefined, delta / (1 + constraints.length)])
                     backgroundRanks.push(conformalRank(backgroundP.length, budget, d));
@@ -321,7 +348,7 @@ export function trainHeads(input) {
                 sel.guarantee = { mode, kind: 'none', alpha: sel.guarantee.alpha };
             }
             threshold = sel.threshold ?? heuristic();
-            guarantee = sel.guarantee;
+            guarantee = sel.threshold === null ? { ...sel.guarantee, kind: 'none', fallback: 'heuristic' } : sel.guarantee;
             sufficiency = sel.sufficiency;
             sufficiency.chosen = sel.threshold === null ? 'heuristic' : sufficiency.chosen;
             if (slices) {
@@ -341,7 +368,7 @@ export function trainHeads(input) {
             result.warnings.push(...sel.warnings.map((w) => `${name}: ${w}`));
             log(`${name}: ${mode} threshold ${threshold} (${guarantee.kind} guarantee, ${positives.length} calibration positive groups)`);
         }
-        else if (policy.kind === 'precision' && policy.mode === 'design') {
+        else if (policy.kind === 'precision' && precisionMode === 'design') {
             if (!calDesign)
                 throw new Error(`${name}: precision mode 'design' needs sampled calibration records (records)`);
             const designMethod = policy.designMethod ?? 'linearised';
@@ -375,6 +402,12 @@ export function trainHeads(input) {
                 }
                 log(`${name}: design precision threshold ${threshold} (${res.guarantee}, ${designMethod}, ${res.firedEffective.toFixed(1)} effective fired)`);
             }
+            else if (policy.fallback === 'heuristic') {
+                // Too little evidence for the guarantee, and the policy chose a heuristic threshold for that case.
+                result.warnings.push(`${name}: design: ${res.reason}; heuristic threshold (fallback), no guarantee`);
+                threshold = heuristic();
+                guarantee = { mode: 'design', kind: 'none', alpha, metric: 'precision', fallback: 'heuristic' };
+            }
             else {
                 result.failures.push(`${name}: design: ${res.reason}`);
                 threshold = nextUp(1);
@@ -386,10 +419,20 @@ export function trainHeads(input) {
             threshold = heuristic();
             if (policy.kind === 'recall')
                 guarantee = { mode: 'heuristic', kind: 'none', alpha: 1 - policy.targetRecall };
+            if (policy.kind === 'precision' && precisionMode === undefined && policy.fallback !== 'heuristic') {
+                // No guarantee is possible here, and none was waived: the head may ship only in shadow mode.
+                result.failures.push(`${name}: no precision guarantee without sampled calibration records - pass records (mode 'design'), or set mode 'heuristic' (or fallback 'heuristic') to accept an unguaranteed threshold`);
+            }
+            else if (policy.kind === 'precision' && precisionMode === undefined) {
+                guarantee = { mode: 'heuristic', kind: 'none', alpha: 1 - policy.targetPrecision, metric: 'precision', fallback: 'heuristic' };
+                result.warnings.push(`${name}: no sampled calibration records, so no precision guarantee: heuristic threshold (fallback)`);
+            }
+            else
+                result.warnings.push(`${name}: mode 'heuristic' was chosen - the threshold carries no guarantee`);
         }
         if (records && !result.design.heads[name])
             result.design.heads[name] = { calibration: 'design-weighted', threshold: mode, evaluation: 'design-linearised' };
-        if (policy.kind === 'precision' && policy.mode !== 'design' && !pCal.some((p) => p >= threshold)) {
+        if (policy.kind === 'precision' && precisionMode !== 'design' && !pCal.some((p) => p >= threshold)) {
             result.warnings.push(`${name}: no calibration example reaches the target precision ${threshold} - the head is unlikely ever to fire`);
         }
         if (dismissal && !(threshold > 0)) {
@@ -471,4 +514,32 @@ export function assertRoundTrip(artifact, X, testProbabilities, sample = 50) {
                 throw new Error(`${head}: runtime scoring of the saved artifact differs from evaluation (${runtime} vs ${probs.p[j]})`);
         });
     }
+}
+/**
+ * The artifact for a training result, with its gates taken from the result (passed exactly when no
+ * gate failed), so they are never set by hand. Also records the reference, head choices, convergence,
+ * provenance, design and weak-label summaries. Serve it through validateArtifact(raw, { mode }).
+ */
+export function buildArtifact(result, options) {
+    const training = { ...(options.training ?? {}) };
+    if (Object.keys(result.headChoice).length)
+        training.head_choice = result.headChoice;
+    if (Object.keys(result.convergence).length)
+        training.convergence = result.convergence;
+    if (Object.keys(result.weakLabels).length)
+        training.weak_labels = result.weakLabels;
+    if (result.provenance)
+        training.provenance = result.provenance;
+    if (result.design)
+        training.design = result.design;
+    return {
+        version: options.version,
+        created_at: options.createdAt ?? new Date().toISOString(),
+        embedding: options.embedding,
+        heads: result.heads,
+        ...(result.reference ? { reference: result.reference } : {}),
+        training,
+        evaluation: result.evaluation,
+        gates: { passed: result.failures.length === 0, failures: [...result.failures], warnings: [...result.warnings] },
+    };
 }

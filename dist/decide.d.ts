@@ -28,8 +28,8 @@ export interface DecisionPolicy<H extends string = string> {
  */
 export declare function missingPolicyHeads<H extends string>(artifact: ClassifierArtifact<H>, policy: DecisionPolicy<H>): H[];
 /**
- * Throws if a head the artifact contains has a missing or non-finite score: that is a scoring bug, not
- * a negative. `dismissed`: heads a certified dismissal rule cleared for this message (rule-miner's
+ * Throws if a head the artifact contains has a missing or non-finite score, or one outside [0, 1]: that
+ * is a scoring bug or a corrupted artifact, not a negative. `dismissed`: heads a certified dismissal rule cleared for this message (rule-miner's
  * matcher.evaluate); they need no score, never fire and never suppress, as their training counted.
  */
 export declare function decide<H extends string>(artifact: ClassifierArtifact<H>, scores: Scores<H>, policy: DecisionPolicy<H>, dismissed?: readonly H[], fired?: H | null): Decision<H>;

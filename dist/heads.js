@@ -17,9 +17,9 @@
  * embeddings (float32, base64) and a label column per head. It is data derived from training
  * messages (embeddings can be partly inverted to text): treat the artifact accordingly.
  *
- * Research behind this (support-example/RESEARCH.md): kNN wins clustered labels (Banking77 `urgent`
- * false alarms 1.02% -> 0.29%), the stack is never worse (better in 18/18 seeds on `urgent`), and
- * choosing per label by cross-validation on the training rows beats any fixed choice (Sim A).
+ * When each pays: knn suits clustered labels (positives that come in a few tight groups) and does
+ * poorly on diffuse ones; the stack hedges between them. No type wins every label, which is why
+ * type 'auto' chooses per label by cross-validation on the training rows.
  */
 import { decisionFunction, fitLogistic, seededRandom } from '@liquidau/solvers';
 export const HEAD_TYPES = ['linear', 'knn', 'stack'];
@@ -246,7 +246,7 @@ export function headFeatureVector(head, features, embedding, ref, sims) {
     return [decisionFunction({ coef: features.linear.weights, intercept: features.linear.bias }, embedding), knn, knnFeature(simsPca, pos, neg, features.k)];
 }
 // ---------- training ----------
-/** Fold of a row (FNV-style hash of its key), as the research's cross-fitting. */
+/** Fold of a row (FNV-style hash of its key). */
 export function foldOf(key) {
     return [...key].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % FOLDS;
 }
@@ -256,7 +256,7 @@ export function foldOf(key) {
  */
 export function fitFeatures(type, t) {
     if (type === 'linear') {
-        return { train: t.rows.map((i) => Array.from(t.X[i])), apply: (x) => Array.from(x) };
+        return { train: t.rows.map((i) => Array.from(t.X[i])), apply: (x) => Array.from(x), converged: true };
     }
     const k = KNN_K;
     const refFold = t.referenceKeys.map(foldOf);
@@ -274,6 +274,7 @@ export function fitFeatures(type, t) {
             features: { kind: 'knn', k },
             train: knnTrain.map((v) => [v]),
             apply: (x) => [knnFeature(simsTo(x), all.pos, all.neg, k)],
+            converged: true,
         };
     }
     // stack: linear logit, knn, knn on 50 principal components; each out-of-fold for training rows.
@@ -307,6 +308,7 @@ export function fitFeatures(type, t) {
         features,
         train: t.rows.map((_, n) => [linearTrain[n], knnTrain[n], knnPcaTrain[n]]),
         apply: (x) => [decisionFunction({ coef: features.linear.weights, intercept: features.linear.bias }, x), knnFeature(simsTo(x), all.pos, all.neg, k), knnPcaFull(x)],
+        converged: lin.converged,
     };
 }
 /**

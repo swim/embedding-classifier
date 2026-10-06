@@ -9,8 +9,8 @@ export function missingPolicyHeads(artifact, policy) {
     return [...named].filter((h) => artifact.heads[h] === undefined);
 }
 /**
- * Throws if a head the artifact contains has a missing or non-finite score: that is a scoring bug, not
- * a negative. `dismissed`: heads a certified dismissal rule cleared for this message (rule-miner's
+ * Throws if a head the artifact contains has a missing or non-finite score, or one outside [0, 1]: that
+ * is a scoring bug or a corrupted artifact, not a negative. `dismissed`: heads a certified dismissal rule cleared for this message (rule-miner's
  * matcher.evaluate); they need no score, never fire and never suppress, as their training counted.
  */
 export function decide(artifact, scores, policy, dismissed = [], fired = null) {
@@ -24,6 +24,8 @@ export function decide(artifact, scores, policy, dismissed = [], fired = null) {
         const score = scores[head];
         if (typeof score !== 'number' || !Number.isFinite(score))
             throw new Error(`head ${head} has no finite score (${score})`);
+        if (score < 0 || score > 1)
+            throw new Error(`head ${head} has a score outside [0, 1] (${score}): not a calibrated probability`);
         return score >= spec[level];
     };
     const suppressed = new Set();

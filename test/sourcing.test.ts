@@ -538,3 +538,37 @@ test('provenanceEmbeddings: the near-duplicate check uses real embeddings when X
   assert.ok(fixed.provenance!.dropped.length < naive.provenance!.dropped.length);
   assert.throws(() => trainHeads({ X: score, split, records, heads, seed: 1, provenanceEmbeddings: { X: embeddings.slice(1) } }), /provenanceEmbeddings.X has/);
 });
+
+test('designSample topFactor: top band oversampled, total kept, factor 1 unchanged, estimates still unbiased', () => {
+  const base = design(7, 1600);
+  const twice = designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 1600, method: 'proportional', topFactor: 2 }, scoringModel: 'old-v1', seed: 7 });
+  assert.equal(twice.records.length, 1600);
+  assert.equal(twice.design.allocation.topFactor, 2);
+  // Sampling rate of the top band against the bottom band: about 2 (floors and rounding aside).
+  const rate = (d: typeof twice, band: string) => { const st = d.design.strata.filter((s) => s.name.includes(`|${band}`)); return st.reduce((a, s) => a + s.n, 0) / st.reduce((a, s) => a + s.N, 0); };
+  const ratio = rate(twice, 'band0') / rate(twice, 'band2');
+  assert.ok(ratio > 1.8 && ratio < 2.2, `top/bottom sampling-rate ratio ${ratio}`);
+  assert.ok(Math.abs(rate(base, 'band0') / rate(base, 'band2') - 1) < 0.15, 'proportional stays proportional');
+  for (const s of twice.design.strata) assert.ok(Math.abs(s.pi - s.n / s.N) < 1e-12);
+  // Factor 1 is exactly today's allocation.
+  const one = designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 1600, method: 'proportional', topFactor: 1 }, scoringModel: 'old-v1', seed: 7 });
+  assert.deepEqual(one.design.strata.map((s) => s.n), base.design.strata.map((s) => s.n));
+  assert.equal(one.design.allocation.topFactor, undefined);
+  // Misuse.
+  assert.throws(() => designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 1600, method: 'manual', manual: {}, topFactor: 2 }, scoringModel: 'm', seed: 1 }), /topFactor applies to method 'proportional' only/);
+  assert.throws(() => designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 1600, method: 'proportional', topFactor: 0.5 }, scoringModel: 'm', seed: 1 }), /topFactor must be a number >= 1/);
+  const five = designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 1600, method: 'proportional', topFactor: 5 }, scoringModel: 'm', seed: 1 });
+  assert.ok(five.design.warnings.some((w) => /above 4, the largest factor tested/.test(w)));
+  // Horvitz-Thompson prevalence over the calibration share stays unbiased under oversampling.
+  const truthRate = frame.filter((f) => f.truth).length / frame.length;
+  let sum = 0;
+  const draws = 300;
+  for (let s = 0; s < draws; s++) {
+    const d = designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 1200, method: 'proportional', topFactor: 3 }, scoringModel: 'm', seed: 100 + s });
+    const cal = d.records.filter((r) => r.role === 'calibration');
+    const dz = designOf(cal);
+    const r = stratifiedRatio({ ...dz, num: cal.map((x) => byId.get(x.id)!.truth), den: cal.map(() => 1) });
+    sum += r.estimate;
+  }
+  assert.ok(Math.abs(sum / draws - truthRate) < 0.003, `mean HT prevalence ${sum / draws} vs ${truthRate}`);
+});

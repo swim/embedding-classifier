@@ -145,14 +145,18 @@ test('trainHeads: conformal modes, stored guarantee, conformal review floor and 
   assert.throws(bad({ ...spec.guarantee, delta: undefined }), /a pac guarantee needs delta/);
   assert.throws(bad({ ...spec.guarantee, mode: 'magic' }), /unknown threshold mode magic/);
 
-  const heuristic = trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.9, designRecall: 0.95 } }] });
+  const heuristic = trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.9, designRecall: 0.95, mode: 'heuristic' } }] });
   assert.equal(heuristic.heads.h!.guarantee?.kind, 'none', 'a heuristic threshold states that it guarantees nothing');
   const c = heuristic.evaluation.h!.certified;
   assert.ok(c.recall_lower <= heuristic.evaluation.h!.recall && heuristic.evaluation.h!.recall <= c.recall_upper);
 
   const clash = trainHeads({ X, split, background, heads: [{ name: 'h', y, prevalence: 0.05, policy: { ...policy, targetRecall: 0.9, mode: 'auto' } }] });
   assert.ok(clash.failures.some((f) => /^h: auto: .*choose a mode explicitly/.test(f)), clash.failures.join('; '));
-  assert.throws(() => trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.9 } }] }), /designRecall is required/);
+  assert.throws(() => trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.9, mode: 'heuristic' } }] }), /designRecall is required/);
+  // The default is the strongest guarantee the data supports (here conformal: no sampled records), not the heuristic.
+  const byDefault = trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.9 } }] });
+  assert.equal(byDefault.heads.h!.guarantee?.mode, 'auto');
+  assert.notEqual(byDefault.heads.h!.guarantee?.kind, 'none');
 
   // Too little data for any guarantee: keep only a handful of calibration positives.
   const few = y.map((v, i) => (split[i] === 'calibration' && v === 1 && i % 120 !== 2 ? null : v));
@@ -161,4 +165,30 @@ test('trainHeads: conformal modes, stored guarantee, conformal review floor and 
   assert.equal(allowed.evaluation.h!.sufficiency?.chosen, 'heuristic');
   assert.ok(allowed.warnings.some((w) => /^h: guarantee inconclusive/.test(w)) && !allowed.failures.some((f) => /allowHeuristicFallback/.test(f)), 'allowed by default');
   assert.ok(tiny(false).failures.some((f) => /^h: auto: .*allowHeuristicFallback is false/.test(f)));
+});
+
+test("fallback: 'heuristic' per head: a guarantee when the labels support one, a recorded heuristic threshold when they don't", () => {
+  const { X, y, split } = dataset(2400);
+  // A handful of calibration positives: no guarantee is possible.
+  const few = y.map((v, i) => (split[i] === 'calibration' && v === 1 && i % 120 !== 2 ? null : v));
+  const policy: HeadPolicy = { kind: 'recall', targetRecall: 0.9, designRecall: 0.95 };
+  const strict = trainHeads({ X, split, heads: [{ name: 'h', y: few, prevalence: 0.05, policy }] });
+  assert.ok(strict.failures.length > 0, 'by default a head the data cannot support fails');
+  const lenient = trainHeads({ X, split, heads: [{ name: 'h', y: few, prevalence: 0.05, policy: { ...policy, fallback: 'heuristic' } }] });
+  assert.deepEqual(lenient.failures.filter((f) => /auto|guarantee/.test(f)), []);
+  assert.equal(lenient.heads.h!.guarantee?.kind, 'none');
+  assert.equal(lenient.heads.h!.guarantee?.fallback, 'heuristic');
+  // With enough positives the same policy keeps its guarantee.
+  const enough = trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: { ...policy, fallback: 'heuristic' } }] });
+  assert.notEqual(enough.heads.h!.guarantee?.kind, 'none');
+  assert.equal(enough.heads.h!.guarantee?.fallback, undefined);
+  // A recall fallback needs designRecall; precision without records may fall back too.
+  assert.throws(() => trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.9, fallback: 'heuristic' } }] }), /needs designRecall/);
+  const p = trainHeads({ X, split, heads: [{ name: 'p', y, prevalence: 0.05, policy: { kind: 'precision', targetPrecision: 0.5, fallback: 'heuristic' } }] });
+  assert.ok(!p.failures.some((f) => /no precision guarantee/.test(f)));
+  assert.equal(p.heads.p!.guarantee?.fallback, 'heuristic');
+  // The artifact records the fallback, and only with kind 'none'.
+  const art = { version: 'v', created_at: '', embedding: { model_id: 't', dimensions: 8, normalize: false }, heads: lenient.heads };
+  validateArtifact(JSON.parse(JSON.stringify(art)));
+  assert.throws(() => validateArtifact({ ...art, heads: { h: { ...lenient.heads.h!, guarantee: { ...lenient.heads.h!.guarantee!, kind: 'pac', delta: 0.05 } } } }), /fallback guarantee must be/);
 });

@@ -1,4 +1,5 @@
 import { type Guarantee } from './conformal.ts';
+import { type HeadFeatures, type ReferenceSet } from './heads.ts';
 export type Calibration = {
     method: 'platt';
     a: number;
@@ -9,8 +10,20 @@ export type Calibration = {
     y: number[];
 };
 export interface HeadSpec {
+    /** One per embedding dimension, or per feature for knn (1) and stack (3) heads. */
     weights: number[];
     bias: number;
+    /** knn and stack heads: how the embedding becomes the head's features (absent: linear on the embedding). */
+    features?: HeadFeatures;
+    /**
+     * Certified dismissal rules in front of this head (rule-miner): messages they clear count as misses
+     * in the head's guarantee, and decide() takes them as dismissed. For audit.
+     */
+    dismissal?: {
+        rule_set: string;
+        max_rate: number;
+        certified: number;
+    };
     calibration: Calibration;
     /** Act at or above this calibrated probability. */
     threshold: number;
@@ -44,12 +57,15 @@ export interface ClassifierArtifact<H extends string = string> {
     created_at: string;
     embedding: EmbeddingSpec;
     heads: Partial<Record<H, HeadSpec>>;
+    /** Training embeddings shared by knn and stack heads (data derived from training messages). */
+    reference?: ReferenceSet;
     training?: Record<string, unknown>;
     evaluation?: Record<string, unknown>;
     gates?: GateResult;
 }
 export type Scores<H extends string = string> = Partial<Record<H, number>>;
 export declare function calibrate(calibration: Calibration, logit: number): number;
+/** A linear head's probability (knn and stack heads need the artifact's reference: use scoreEmbedding). */
 export declare function headProbability(spec: HeadSpec, embedding: ArrayLike<number>): number;
 /**
  * Validates an artifact loaded from storage; throws with a specific reason if it's unusable.
@@ -62,3 +78,9 @@ export declare function validateArtifact<H extends string = string>(raw: unknown
 }): ClassifierArtifact<H>;
 /** Calibrated probability for every head in the artifact. */
 export declare function scoreEmbedding<H extends string>(artifact: ClassifierArtifact<H>, embedding: ArrayLike<number>): Scores<H>;
+/**
+ * Heads certified with a different dismissal rule set than the one the rules tier runs (`ruleSet`:
+ * its identity, e.g. rule-miner's ruleSetHash). Each such head's guarantee counted another rule set's
+ * misses, so it doesn't describe the system: refuse to serve while this is non-empty.
+ */
+export declare function checkRuleSetPairing<H extends string>(artifact: ClassifierArtifact<H>, ruleSet: string): string[];

@@ -1,8 +1,5 @@
-/**
- * Truncates to at most maxChars UTF-16 code units without splitting a surrogate pair. Use the same
- * function at runtime so training and serving embed identical text.
- */
-export declare function truncateText(text: string, maxChars?: number): string;
+import { truncateText } from './text.ts';
+export { truncateText };
 export interface CachedEmbedderOptions {
     cachePath: string;
     /** One text at a time - or pass embedBatch for providers that take many per call. */
@@ -18,13 +15,19 @@ export interface CachedEmbedderOptions {
     concurrency?: number;
     /** Write the cache every N new embeddings, so an interrupted run keeps what it paid for (default 200). */
     checkpointEvery?: number;
+    /** 'json' (default) or 'binary' (append-only float32; for large caches, needs `dimensions`). See above. */
+    format?: 'json' | 'binary';
     log?: (line: string) => void;
 }
 export declare class CachedEmbedder {
     readonly cachePath: string;
     private readonly options;
     private readonly cache;
+    /** binary: keys embedded since the last checkpoint, in order. */
+    private pending;
     constructor(options: CachedEmbedderOptions);
+    /** Reads the binary cache, trimming anything after the last complete, matched entry from both files. */
+    private loadBinary;
     private checkDimensions;
     private truncate;
     private key;

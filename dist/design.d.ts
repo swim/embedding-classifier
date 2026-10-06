@@ -35,6 +35,8 @@ export interface DesignSummary {
     designId: string;
     allocation: {
         method: DesignOptions['allocation']['method'];
+        /** proportional: the top score band's oversampling factor, when not 1. */
+        topFactor?: number;
         minExpectedPositives?: number;
         minShare?: number;
         priorRates?: Record<string, number>;
@@ -95,6 +97,22 @@ export interface DesignOptions {
          * and proving it empty would cost most of the stratum.
          */
         minShare?: number;
+        /**
+         * proportional only: draw strata in the TOP score band (band 0, rule-firing or not) at this
+         * multiple of their proportional share, other strata scaled down to keep the total (default 1).
+         * Inclusion probabilities stay n_h / N_h, so every estimator stays unbiased; more of the sample
+         * lands where positives are, so guarantees need fewer labels.
+         *
+         * Only with an INDEPENDENT score. When `signals.score` comes from a model whose errors differ from
+         * the head being certified (e.g. an offline LLM teacher run in batch over the frame), 2-4 was safe
+         * on real score shapes and cut false alarms at a recall guarantee by a third to two thirds
+         * (support-example RESEARCH.md, Stage S and Sim D). With the head's OWN (round-0) score, don't:
+         * at 2 the recall bound was borderline (6.3-6.7% misses against 5%) and at 4 it failed (11-12%),
+         * because missed positives are exactly the low-scoring units such oversampling thins out - the
+         * same effect behind the 57% failure rate of heavily over-sampled designs noted in docs/DATA.md.
+         * Any factor above 1 adds a warning saying so; above 4 is untested.
+         */
+        topFactor?: number;
     };
     /** Default 30. */
     minPerStratum?: number;

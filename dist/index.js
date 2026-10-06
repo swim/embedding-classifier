@@ -1,5 +1,5 @@
-export { calibrate, headProbability, scoreEmbedding, validateArtifact } from "./artifact.js";
-export { decide, missingPolicyHeads } from "./decide.js";
+export { calibrate, checkRuleSetPairing, headProbability, scoreEmbedding, validateArtifact } from "./artifact.js";
+export { decide, missingPolicyHeads, settleWithRules } from "./decide.js";
 export { budgetThreshold, falseAlarmCap, nextUp, pickThreshold } from "./threshold.js";
 export { evaluateHead } from "./evaluate.js";
 export { gateHead } from "./gates.js";
@@ -13,3 +13,5 @@ export { mmrSelect, retrieveFromSeeds, seedStats } from "./retrieval.js";
 export { realHardNegatives, selectForReview, verifyBatch } from "./hardnegatives.js";
 export { checkSliceAxes, coverageReport, defineAxes } from "./coverage.js";
 export { monitorWindow } from "./monitor.js";
+export { truncateText } from "./text.js";
+export { HEAD_TYPES } from "./heads.js";

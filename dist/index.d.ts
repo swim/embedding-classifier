@@ -1,14 +1,14 @@
-export { calibrate, headProbability, scoreEmbedding, validateArtifact } from './artifact.ts';
+export { calibrate, checkRuleSetPairing, headProbability, scoreEmbedding, validateArtifact } from './artifact.ts';
 export type { Calibration, ClassifierArtifact, EmbeddingSpec, GateResult, HeadSpec, Scores } from './artifact.ts';
-export { decide, missingPolicyHeads } from './decide.ts';
-export type { Decision, DecisionPolicy, DecisionReason } from './decide.ts';
+export { decide, missingPolicyHeads, settleWithRules } from './decide.ts';
+export type { Decision, DecisionPolicy, DecisionReason, RulesEvaluation, Settlement } from './decide.ts';
 export { budgetThreshold, falseAlarmCap, nextUp, pickThreshold } from './threshold.ts';
 export type { HeadPolicy } from './threshold.ts';
 export { evaluateHead } from './evaluate.ts';
 export type { BaselineComparison, CertifiedBounds, DesignEstimate, DesignEvaluation, EvaluateInput, HeadEvaluation } from './evaluate.ts';
 export { gateHead } from './gates.ts';
 export { assertRoundTrip, SPLITS, trainHeads } from './train.ts';
-export type { HeadInput, ProvenanceSummary, Split, TrainInput, TrainResult, WeakInput, WeakSummary } from './train.ts';
+export type { HeadChoice, HeadInput, ProvenanceSummary, Split, TrainInput, TrainResult, WeakInput, WeakSummary } from './train.ts';
 export { loadOrder, publishPlan, refuseToServe } from './lifecycle.ts';
 export type { ArtifactRole, ServeMode } from './lifecycle.ts';
 export { reportMarkdown } from './report.ts';
@@ -24,4 +24,7 @@ export { realHardNegatives, selectForReview, verifyBatch } from './hardnegatives
 export { checkSliceAxes, coverageReport, defineAxes } from './coverage.ts';
 export type { Axes, CoverageReport } from './coverage.ts';
 export { monitorWindow } from './monitor.ts';
+export { truncateText } from './text.ts';
+export { HEAD_TYPES } from './heads.ts';
+export type { HeadFeatures, HeadType, ReferenceSet } from './heads.ts';
 export type { DriftCheck } from './monitor.ts';

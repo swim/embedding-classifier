@@ -26,8 +26,8 @@ function tempDir(t: { after: (fn: () => void) => void }): string {
   return dir;
 }
 
-const recall: HeadPolicy = { kind: 'recall', targetRecall: 0.95, designRecall: 0.98, maxFalseAlarm: 0.05, minPositives: 150, minRecallLower: 0.9, minPositiveGroups: 30 };
-const precision: HeadPolicy = { kind: 'precision', targetPrecision: 0.8 };
+const recall: HeadPolicy = { kind: 'recall', mode: 'heuristic', targetRecall: 0.95, designRecall: 0.98, maxFalseAlarm: 0.05, minPositives: 150, minRecallLower: 0.9, minPositiveGroups: 30 };
+const precision: HeadPolicy = { kind: 'precision', mode: 'heuristic', targetPrecision: 0.8 };
 
 test('recall threshold never exceeds the false-alarm budget, even with an outlier positive', () => {
   const neg = Array.from({ length: 20 }, (_, i) => 0.01 * (i + 1));
@@ -116,7 +116,7 @@ test('trainHeads end to end: fits, gates, and the serialised artifact scores ide
     X, split, C: 1, log: (l) => lines.push(l),
     heads: [
       { name: 'urgent', y, prevalence: 0.05, policy: { ...recall, targetRecall: 0.9, designRecall: 0.95, minPositiveGroups: undefined } as HeadPolicy },
-      { name: 'spam', y, prevalence: 0.05, policy: { kind: 'precision', targetPrecision: 0.5 } },
+      { name: 'spam', y, prevalence: 0.05, policy: { kind: 'precision', mode: 'heuristic', targetPrecision: 0.5 } },
     ],
     slices: { third: X.map((_, i) => String(i % 3)) },
   });
@@ -216,7 +216,7 @@ test('background budget: thresholds rise until the head fires on at most maxRate
 
   const { X, y, split } = dataset(2400);
   const heads = (maxRate?: number) => trainHeads({
-    X, split, heads: [{ name: 'urgent', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.5, designRecall: 0.9, maxFalseAlarm: 0.2 } as HeadPolicy }],
+    X, split, heads: [{ name: 'urgent', y, prevalence: 0.05, policy: { kind: 'recall', mode: 'heuristic', targetRecall: 0.5, designRecall: 0.9, maxFalseAlarm: 0.2 } as HeadPolicy }],
     background: maxRate === undefined ? undefined : { X: X.filter((_, i) => y[i] === 0).slice(0, 400), maxRate: { urgent: maxRate } },
   });
   const loose = heads(), tight = heads(0.001);
@@ -290,4 +290,58 @@ test('trainHeads: weak positives are capped, train-only, and reported', () => {
   assert.doesNotThrow(head({ X: [trainRow], weights: [1] }), 'a train row may also be a weak example');
   const withBackground = () => trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: precision, weak: { X: [weakX[0]], weights: [1] } }], background: { X: [weakX[0]], maxRate: {} } });
   assert.throws(withBackground, /background example/);
+});
+
+test("cached embedder, format 'binary': append-only checkpoints, resume, repair after an interrupted append", async (t) => {
+  const { appendFileSync, readFileSync, statSync } = await import('node:fs');
+  const cachePath = join(tempDir(t), 'nested', 'cache');
+  const calls: string[] = [];
+  const embed = async (text: string) => { calls.push(text); return hashEmbedding(text, 4); };
+  assert.throws(() => new CachedEmbedder({ cachePath, embed, format: 'binary' }), /needs dimensions/);
+  const first = new CachedEmbedder({ cachePath, embed, dimensions: 4, format: 'binary', checkpointEvery: 1, concurrency: 1, log: () => {} });
+  const out = await first.embedMany(['alpha', 'beta', 'gamma']);
+  assert.deepEqual(out[1], hashEmbedding('beta', 4).map(Math.fround), 'stored as float32');
+  assert.equal(statSync(`${cachePath}.f32`).size, 3 * 4 * 4, 'three float32 rows');
+  assert.equal(readFileSync(`${cachePath}.keys`, 'utf8').split('\n').filter(Boolean).length, 3);
+  // A second instance serves the stored vectors and appends only new ones.
+  const second = new CachedEmbedder({ cachePath, embed, dimensions: 4, format: 'binary', log: () => {} });
+  await second.embedMany(['alpha', 'delta']);
+  assert.deepEqual(calls, ['alpha', 'beta', 'gamma', 'delta'], 'alpha came from the cache');
+  assert.equal(statSync(`${cachePath}.f32`).size, 4 * 4 * 4);
+  // An interrupted append: a partial vector with no key. The next load trims it and keeps going.
+  appendFileSync(`${cachePath}.f32`, new Uint8Array(6));
+  const third = new CachedEmbedder({ cachePath, embed, dimensions: 4, format: 'binary', log: () => {} });
+  assert.equal(statSync(`${cachePath}.f32`).size, 4 * 4 * 4, 'trimmed back to the last matched entry');
+  const [eps] = await third.embedMany(['epsilon']);
+  const fourth = new CachedEmbedder({ cachePath, embed, dimensions: 4, format: 'binary', log: () => {} });
+  assert.deepEqual((await fourth.embedMany(['epsilon']))[0], eps, 'the appended vector lines up with its key');
+  assert.equal(calls.filter((c) => c === 'epsilon').length, 1);
+  // A different-sized model can't read it: its rows wouldn't line up.
+  assert.throws(() => new CachedEmbedder({ cachePath, embed, format: 'binary', dimensions: 0 }), /needs dimensions/);
+});
+
+test('trainHeads records whether each head\'s fits converged (model and Platt calibrator)', () => {
+  const { X, y, split } = dataset(1200);
+  const result = trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.8, designRecall: 0.9 } }] });
+  assert.deepEqual(result.convergence.h, { model: true, calibration: true });
+  assert.ok(!result.warnings.some((w) => w.includes('did not converge')));
+});
+
+test('buildArtifact records the gates from the result; validateArtifact enforces them and refuses inconsistent ones', async () => {
+  const { buildArtifact, validateArtifact } = await import('../src/index.ts');
+  const { X, y, split } = dataset(1200);
+  const embedding = { model_id: 't', dimensions: 8, normalize: false };
+  const good = buildArtifact(trainHeads({ X, split, heads: [{ name: 'h', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.8 } }] }), { version: 'v1', embedding });
+  assert.equal(good.gates!.passed, good.gates!.failures.length === 0);
+  // Without sampled records a precision head can have no guarantee: it fails unless 'heuristic' is chosen.
+  const unguaranteed = trainHeads({ X, split, heads: [{ name: 'p', y, prevalence: 0.05, policy: { kind: 'precision', targetPrecision: 0.5 } }] });
+  assert.ok(unguaranteed.failures.some((f) => /no precision guarantee without sampled calibration records/.test(f)));
+  const chosen = trainHeads({ X, split, heads: [{ name: 'p', y, prevalence: 0.05, policy: { kind: 'precision', targetPrecision: 0.5, mode: 'heuristic' } }] });
+  assert.ok(!chosen.failures.some((f) => /no precision guarantee/.test(f)) && chosen.warnings.some((w) => /carries no guarantee/.test(w)));
+  const failing = buildArtifact(unguaranteed, { version: 'v2', embedding });
+  assert.equal(failing.gates!.passed, false);
+  validateArtifact(failing, { mode: 'shadow' });
+  assert.throws(() => validateArtifact(failing, { mode: 'enforce' }), /gates did not pass/);
+  assert.throws(() => validateArtifact({ ...failing, gates: undefined }, { mode: 'enforce' }), /gates did not pass \(or were not recorded\)/);
+  assert.throws(() => validateArtifact({ ...failing, gates: { ...failing.gates!, passed: true } }), /passed but record/);
 });

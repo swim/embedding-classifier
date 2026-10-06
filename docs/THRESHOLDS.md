@@ -7,16 +7,33 @@ below are the threshold and gate entries from [API.md](API.md).
 
 | Head kind | Mode | Use when | Guarantee |
 |---|---|---|---|
-| recall | `heuristic` (default) | Exploring, low stakes | None |
+| recall | `heuristic` (only when set explicitly) | Exploring, low stakes | None |
 | recall | `conformal-expected` | Some calibration positives, equal inclusion probabilities | Recall ≥ target on average |
 | recall | `conformal-pac` | Enough calibration positives, equal inclusion probabilities | Recall ≥ target with probability 1 − δ |
-| recall | `auto` | Calibration was not design-sampled | The strongest conformal guarantee the data supports |
-| recall | `design` | Calibration came from `designSample` | Recall ≥ target with probability 1 − δ, from the design |
-| precision | `heuristic` (default) | Exploring | None |
-| precision | `design` | Calibration came from `designSample` | Precision ≥ target with probability 1 − δ, from the design |
+| recall | `auto` (default without sampled records) | Calibration was not design-sampled | The strongest conformal guarantee the data supports; by default no heuristic fallback |
+| recall | `design` (default with sampled records) | Calibration came from `designSample` | Recall ≥ target with probability 1 − δ, from the design |
+| precision | `heuristic` (only when set explicitly) | Exploring | None |
+| precision | `design` (default with sampled records) | Calibration came from `designSample` | Precision ≥ target with probability 1 − δ, from the design. Without sampled records and without `heuristic` set, the head fails its gates |
 
 The conformal modes and `auto` refuse unequal inclusion probabilities, so design-sampled
 calibration needs `design`. Precision heads accept only `heuristic` and `design`.
+
+**The default is the strongest guarantee the data supports** (since 0.7): `design` with sampled
+calibration records, else `auto` without the silent heuristic fallback; a head the data can't
+support fails its gates, and can still be served in shadow mode. `heuristic` carries no guarantee
+and must be chosen explicitly (a warning records the choice). The trade-off: a guaranteed threshold
+is set conservatively, so it fires on somewhat more negatives than a heuristic one, and a head with
+too few labelled positives gets no guarantee at all; a heuristic threshold always gives a number, but
+its recall is never checked and can quietly fall short of the target.
+
+**Per-head fallback (`fallback: 'heuristic'`).** For heads whose labels may not yet support a
+guarantee: the head gets the guarantee when its calibration data supports one, and the heuristic
+threshold when it doesn't, instead of failing its gates. The fallback is recorded in the artifact
+(`guarantee.fallback: 'heuristic'`, `kind: 'none'`), with a warning saying how many effective
+calibration positives a guarantee would need, so it is visible to reviewers and to monitoring.
+Recall heads need `designRecall` for it. `fallback: 'fail'` (the default) keeps the strict
+behaviour. The choice is per head (label), made from that head's calibration evidence; a head's
+threshold applies to every message alike.
 
 ## Modes and sufficiency
 

@@ -5,7 +5,8 @@
  * is expressed: suppress the scope heads whenever any priority head is at or above its review floor.
  */
 import type { ClassifierArtifact, Scores } from './artifact.ts';
-export type DecisionReason = 'above_threshold' | 'near_threshold' | 'none';
+/** 'rule': a certified firing rule decided the head (settleWithRules, or `fired` in decide). */
+export type DecisionReason = 'above_threshold' | 'near_threshold' | 'none' | 'rule';
 export interface Decision<H extends string = string> {
     head: H | null;
     reason: DecisionReason;
@@ -26,5 +27,36 @@ export interface DecisionPolicy<H extends string = string> {
  * to serve, or log, if the result isn't what you expect.
  */
 export declare function missingPolicyHeads<H extends string>(artifact: ClassifierArtifact<H>, policy: DecisionPolicy<H>): H[];
-/** Throws if a head the artifact contains has a missing or non-finite score: that is a scoring bug, not a negative. */
-export declare function decide<H extends string>(artifact: ClassifierArtifact<H>, scores: Scores<H>, policy: DecisionPolicy<H>): Decision<H>;
+/**
+ * Throws if a head the artifact contains has a missing or non-finite score: that is a scoring bug, not
+ * a negative. `dismissed`: heads a certified dismissal rule cleared for this message (rule-miner's
+ * matcher.evaluate); they need no score, never fire and never suppress, as their training counted.
+ */
+export declare function decide<H extends string>(artifact: ClassifierArtifact<H>, scores: Scores<H>, policy: DecisionPolicy<H>, dismissed?: readonly H[], fired?: H | null): Decision<H>;
+/** What a rule set says about one message: rule-miner's `ruleSetMatcher(set).evaluate(text)`. */
+export interface RulesEvaluation {
+    fired: {
+        id: string;
+        label: string;
+    } | null;
+    dismissed: readonly string[];
+}
+export type Settlement<H extends string> = {
+    settled: true;
+    decision: Decision<H>;
+} | {
+    settled: false;
+    forward: {
+        fired: H | null;
+        dismissed: H[];
+    };
+};
+/**
+ * The rules tier's decision, without the model: settled when the rules alone fix what `decide` would
+ * return whatever the scores - every head the policy names is dismissed, or a firing rule's head
+ * comes after only dismissed heads in priority and nothing undismissed can suppress it. Otherwise the
+ * message goes to the model tier with what the rules found, for decide(artifact, scores, policy,
+ * forward.dismissed, forward.fired). Both paths give the same decision (tested), so the guarantees
+ * describe the system whichever path a message takes.
+ */
+export declare function settleWithRules<H extends string>(policy: DecisionPolicy<H>, evaluation: RulesEvaluation): Settlement<H>;

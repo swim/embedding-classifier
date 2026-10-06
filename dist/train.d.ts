@@ -2,6 +2,7 @@ import { type DesignSummary } from './design.ts';
 import { type ExampleRecord, type ProvenanceCode, type ProvenanceOptions, type WeightCaps, type WeightCapSummary } from './records.ts';
 import { type ClassifierArtifact, type HeadSpec } from './artifact.ts';
 import { type HeadEvaluation } from './evaluate.ts';
+import { type HeadType, type ReferenceSet } from './heads.ts';
 import { type HeadPolicy } from './threshold.ts';
 export declare const SPLITS: readonly ["train", "calibration", "test"];
 export type Split = (typeof SPLITS)[number];
@@ -19,6 +20,28 @@ export interface HeadInput<H extends string> {
     safetyCritical?: boolean;
     /** Whether an existing mechanism already catches each example (see evaluateHead). */
     baseline?: readonly boolean[];
+    /**
+     * The head's type (default 'linear': today's head). 'knn' and 'stack' score against the artifact's
+     * shared reference of training embeddings (see heads.ts; store result.reference as
+     * artifact.reference); 'auto' picks the type with the lowest cross-validated guarantee cost on the
+     * training rows (recorded in result.headChoice). Calibration, thresholds and guarantees are the same
+     * for every type. Non-linear types need X to be the embeddings, and don't take weak positives.
+     */
+    type?: HeadType | 'auto';
+    /**
+     * Certified dismissal rules in front of this head (rule-miner's mineDismissals and
+     * certifyDismissals): `rows` marks the rows of X a rule cleared (and `background` the rows of
+     * background.X). Cleared calibration, test and background rows score 0, so a positive a rule
+     * dismissed counts as a miss: the head's recall guarantee covers rules and classifier together.
+     * Training is unchanged; calibration is fitted on the rows the rules leave to the classifier.
+     */
+    dismissal?: {
+        rows: readonly boolean[];
+        background?: readonly boolean[];
+        ruleSet: string;
+        maxRate: number;
+        certified: number;
+    };
     /**
      * Extra POSITIVES for the train split only, e.g. rule-miner's weakLabels(): embeddings with a
      * weight in [0, 1] each. They never reach calibration, test or the background budget, and an
@@ -118,8 +141,24 @@ export interface TrainInput<H extends string> {
         X: ReadonlyArray<ArrayLike<number>>;
         background?: ReadonlyArray<ArrayLike<number>>;
     };
-    /** Seed for design bootstraps (default 0). */
+    /** Seed for design bootstraps and the stack head's principal components (default 0). */
     seed?: number;
+    /**
+     * Cross-fitting folds for knn, stack and auto heads: rows with the same key share a fold (default:
+     * `groups`, else the row index). Keep near-duplicates together, or a training row's out-of-fold
+     * score still finds its twin.
+     */
+    foldKeys?: readonly string[];
+    /**
+     * type 'auto': a knn or stack head is chosen only when its cross-validated cost is below the linear
+     * head's × (1 − autoMargin) (default 0.2), then the cheaper of the two. In the research (66 heads ×
+     * seeds, four datasets) no margin left linear in 49 of 66 cases and lost to it in 10; a 20% margin
+     * kept nearly all the gain on recall heads, raised recall on precision heads and lost in 6 (30%
+     * behaved the same; absolute margins of 0.01 or more threw the gains away).
+     */
+    autoMargin?: number;
+    /** Encoding of the knn reference (default 'f32'): 'int8' is about 4× smaller, same results in simulation. */
+    referenceEncoding?: 'f32' | 'int8';
     log?: (line: string) => void;
 }
 /** What provenance enforcement did - store as artifact.training.provenance (with generated, see publishPlan). */
@@ -154,6 +193,10 @@ export interface TrainResult<H extends string> {
     weakLabels: Partial<Record<H, WeakSummary>>;
     /** With records: provenance enforcement - store as artifact.training.provenance. */
     provenance?: ProvenanceSummary;
+    /** Training embeddings for knn and stack heads - store as artifact.reference (scoreEmbedding needs it). */
+    reference?: ReferenceSet;
+    /** Heads trained with type 'auto': each type's cross-validated cost and the choice - store as artifact.training.head_choice. */
+    headChoice: Partial<Record<H, HeadChoice>>;
     /** With sampled records: the designs and each head's estimator - store as artifact.training.design. */
     design?: {
         designs: DesignSummary[];
@@ -163,6 +206,12 @@ export interface TrainResult<H extends string> {
             evaluation: 'design-linearised';
         }>;
     };
+}
+export interface HeadChoice {
+    chosen: HeadType;
+    /** Out-of-fold guarantee cost per type on the training rows (lower is better). */
+    costs: Record<HeadType, number>;
+    criterion: string;
 }
 export declare function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<H>;
 /**

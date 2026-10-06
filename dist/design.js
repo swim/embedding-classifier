@@ -62,6 +62,11 @@ export function designSample(options) {
     const { frame, scoreBands, bySlice = false, mergeSmallStrata = true, allocation, minPerStratum = 30, roleSplit = { train: 0.5, calibration: 0.25, test: 0.25 }, scoringModel, seed } = options;
     if (!frame.length)
         throw new Error('the frame is empty');
+    const topFactor = allocation.topFactor ?? 1;
+    if (!(Number.isFinite(topFactor) && topFactor >= 1))
+        throw new Error(`allocation.topFactor must be a number >= 1, got ${allocation.topFactor}`);
+    if (topFactor !== 1 && allocation.method !== 'proportional')
+        throw new Error(`allocation.topFactor applies to method 'proportional' only (got '${allocation.method}')`);
     if (!scoreBands.every((q, i) => q > 0 && q < 1 && (i === 0 || q < scoreBands[i - 1])))
         throw new Error('scoreBands must be descending quantiles strictly between 0 and 1');
     const splitTotal = roleSplit.train + roleSplit.calibration + roleSplit.test;
@@ -215,10 +220,13 @@ export function designSample(options) {
             throw new Error(`manual allocation needs ${sum} items after floors, above allocation.total ${allocation.total}`);
     }
     else {
-        // Proportional with floors and caps: find c with Σ clamp(c·N_h, floor_h, N_h) = total.
+        // Proportional with floors and caps: find c with Σ clamp(c·f_h·N_h, floor_h, N_h) = total, where
+        // f_h = topFactor for strata in the top score band and 1 otherwise.
         const total = Math.min(allocation.total, N.reduce((a, b) => a + b, 0));
-        let lo = 0, hi = 1;
-        const at = (c) => N.reduce((s, Nh, i) => s + Math.min(Nh, Math.max(floors[i], c * Nh)), 0);
+        const inTop = new Map(cells.map((c) => [c.name, Math.min(...c.bands) === 0]));
+        const f = names.map((h) => (inTop.get(h) ? topFactor : 1));
+        let lo = 0, hi = 1 / Math.min(...f);
+        const at = (c) => N.reduce((s, Nh, i) => s + Math.min(Nh, Math.max(floors[i], c * f[i] * Nh)), 0);
         for (let it = 0; it < 200; it++) {
             const mid = (lo + hi) / 2;
             if (at(mid) < total)
@@ -226,7 +234,11 @@ export function designSample(options) {
             else
                 hi = mid;
         }
-        n = roundWithin(N.map((Nh, i) => Math.min(Nh, Math.max(floors[i], hi * Nh))), floors, N, total);
+        n = roundWithin(N.map((Nh, i) => Math.min(Nh, Math.max(floors[i], hi * f[i] * Nh))), floors, N, total);
+        if (topFactor !== 1)
+            warnings.push(`allocation.topFactor ${topFactor}: valid only if signals.score (${scoringModel}) is independent of the head being certified, e.g. an offline teacher's score; oversampling by the head's own score makes recall bounds under-cover`);
+        if (topFactor > 4)
+            warnings.push(`allocation.topFactor ${topFactor} is above 4, the largest factor tested; check coverage before relying on it`);
     }
     // 4-5. Draw, then assign roles within each stratum, before any labelling.
     const records = [];
@@ -255,6 +267,7 @@ export function designSample(options) {
         designId, scoringModel, seed, duplicatesRemoved, strata: table, warnings, merged,
         allocation: {
             method: allocation.method,
+            ...(topFactor !== 1 ? { topFactor } : {}),
             ...(rateSets.length ? { minExpectedPositives: minExpected, minShare, requiredTotal } : {}),
             ...(rates ? { priorRates: Object.fromEntries(names.map((h, i) => [h, rates[i]])) } : {}),
             ...(rateSets.length && !rates ? { priorRatesByHead: Object.fromEntries(rateSets.map((s) => [s.head, Object.fromEntries(names.map((h, i) => [h, s.rates[i]]))])) } : {}),
@@ -372,8 +385,10 @@ export function applyReviews(key, reviews) {
             warnings.push(`stratum ${s}: ${(100 * v.rate).toFixed(1)}% of queued items were skipped - if skips relate to content, design estimates can be biased`);
     }
     for (const [c, k] of labelledPerCell) {
+        // Linearised bounds pool a one-item stratum's variance with a partner stratum (solvers' collapsed
+        // strata, FINDINGS O6); exact bounds need none. Still worth knowing: the pooled variance is conservative.
         if (k < 2 && !c.endsWith('/train'))
-            warnings.push(`${c}: only ${k} labelled item(s); design variance needs at least 2 per stratum`);
+            warnings.push(`${c}: only ${k} labelled item(s); linearised bounds will pool its variance with a partner stratum (collapsed strata)`);
     }
     return { records, skipRate, warnings };
 }

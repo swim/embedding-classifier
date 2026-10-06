@@ -15,12 +15,12 @@ const result = trainHeads({
   heads: [
     { name: 'urgent', y: yUrgent, prevalence: 0.005, baseline: rulesCaught,
       policy: { kind: 'recall', targetRecall: 0.95, designRecall: 0.98, maxFalseAlarm: 0.05, minPositives: 150, minRecallLower: 0.9 } },
-    { name: 'off_topic', y: yOffTopic, prevalence: 0.05, policy: { kind: 'precision', targetPrecision: 0.8 } },
+    // Without sampled calibration records a precision head can't have a guarantee: choosing
+    // 'heuristic' says so explicitly (otherwise the head fails its gates).
+    { name: 'off_topic', y: yOffTopic, prevalence: 0.05, policy: { kind: 'precision', targetPrecision: 0.8, mode: 'heuristic' } },
   ],
 });
-const artifact = { version, created_at, embedding: { model_id, dimensions, normalize: true },
-  heads: result.heads, evaluation: result.evaluation,
-  gates: { passed: result.failures.length === 0, failures: result.failures, warnings: result.warnings } };
+const artifact = buildArtifact(result, { version, embedding: { model_id, dimensions, normalize: true } }); // gates from the result
 assertRoundTrip(artifact, embeddings, result.testProbabilities);
 
 // Runtime

@@ -109,3 +109,13 @@ test('lifecycle: shadow prefers a candidate, enforce only loads a promoted artif
   assert.match(refuseToServe('enforce', {})!, /gates/, 'no recorded gates is not a pass');
   assert.equal(refuseToServe('shadow', {}), null);
 });
+
+test('validateArtifact refuses isotonic tables that are not probabilities; decide refuses scores outside [0, 1]', async () => {
+  const { validateArtifact, decide } = await import('../src/index.ts');
+  const head = (x: number[], y: number[]) => ({ version: 'v', created_at: '', embedding: { model_id: 't', dimensions: 1, normalize: false }, heads: { h: { weights: [1], bias: 0, calibration: { method: 'isotonic' as const, x, y }, threshold: 0.9, review_floor: 0.5 } } });
+  assert.throws(() => validateArtifact(head([0, 1], [2, 3])), /outside \[0, 1\]/);
+  assert.throws(() => validateArtifact(head([0, 1], [0.6, 0.2])), /decrease/);
+  assert.throws(() => validateArtifact(head([-1, 1], [0.1, 0.2])), /outside \[0, 1\]/);
+  validateArtifact(head([0, 0.5, 1], [0, 0.3, 0.9]));
+  assert.throws(() => decide(head([0, 1], [0, 1]), { h: 2.7 }, { priority: ['h'] }), /outside \[0, 1\]/);
+});

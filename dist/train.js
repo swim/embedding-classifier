@@ -21,6 +21,7 @@ import { conformalThreshold, groupScores } from "./conformal.js";
 import { calibrate, scoreEmbedding, validateArtifact } from "./artifact.js";
 import { evaluateHead } from "./evaluate.js";
 import { gateHead } from "./gates.js";
+import { crossValidatedScores, decodeReference, encodeReference, fitFeatures, guaranteeCost, HEAD_TYPES } from "./heads.js";
 import { budgetThreshold, falseAlarmCap, pickThreshold } from "./threshold.js";
 export const SPLITS = ['train', 'calibration', 'test'];
 function checkLength(name, values, n) {
@@ -40,7 +41,7 @@ function indicesBySplit(split, y) {
     return idx;
 }
 export function trainHeads(input) {
-    const { X, split, C = 1, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, groups, slices, background, records, seed = 0, log = () => { } } = input;
+    const { X, split, C = 1, autoMargin = 0.2, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, groups, slices, background, records, seed = 0, log = () => { } } = input;
     checkLength('split', split, X.length);
     split.forEach((s, i) => {
         if (!SPLITS.includes(s))
@@ -53,9 +54,13 @@ export function trainHeads(input) {
         throw new Error('background.X must be non-empty when a maxRate is set');
     if (!(reviewRatio >= 0 && reviewRatio <= 1))
         throw new Error('reviewRatio must be between 0 and 1');
+    if (!(autoMargin >= 0 && autoMargin < 1))
+        throw new Error('autoMargin must be in [0, 1)');
     if (reviewEpsilon !== undefined && !(reviewEpsilon > 0 && reviewEpsilon < 1))
         throw new Error('reviewEpsilon must be strictly between 0 and 1');
-    const result = { heads: {}, evaluation: {}, failures: [], warnings: [], testProbabilities: {}, weakLabels: {} };
+    const result = { heads: {}, evaluation: {}, failures: [], warnings: [], testProbabilities: {}, weakLabels: {}, headChoice: {} };
+    checkLength('foldKeys', input.foldKeys, X.length);
+    const foldKey = (i) => input.foldKeys?.[i] ?? groups?.[i] ?? `#${i}`;
     // Provenance: validate every record, drop P5 near-duplicates from training, record overrides.
     const excluded = new Set();
     if (records) {
@@ -96,8 +101,32 @@ export function trainHeads(input) {
         heldOut ??= new Set([...X.filter((_, i) => split[i] !== 'train'), ...(background?.X ?? [])].map(vectorKey));
         return heldOut.has(vectorKey(x));
     };
-    for (const { name, y: yIn, policy, prevalence, baseline, weak, maxWeakShare = 0.5 } of input.heads) {
+    // The shared reference for knn, stack and auto heads: training rows labelled for any of them.
+    // Generated records (synthetic text) are left out; retrieved ones are human-labelled and stay.
+    const nonLinear = input.heads.filter((h) => (h.type ?? 'linear') !== 'linear');
+    let reference = null;
+    if (nonLinear.length) {
+        for (const h of nonLinear) {
+            if (!(h.type === 'auto' || HEAD_TYPES.includes(h.type)))
+                throw new Error(`${h.name}: unknown head type ${h.type}`);
+            checkLength(`${h.name}: y`, h.y, X.length);
+        }
+        const generated = new Set(records ? records.flatMap((r, i) => (r.source.kind === 'generated' ? [i] : [])) : []);
+        const index = X.map((_, i) => i).filter((i) => split[i] === 'train' && !excluded.has(i) && !generated.has(i) && nonLinear.some((h) => h.y[i] === 0 || h.y[i] === 1));
+        const leftOut = X.filter((_, i) => split[i] === 'train' && generated.has(i)).length;
+        if (leftOut)
+            result.warnings.push(`reference: ${leftOut} generated training record(s) left out of the knn reference`);
+        const set = encodeReference(index.map((i) => X[i]), Object.fromEntries(nonLinear.map((h) => [h.name, index.map((i) => (h.y[i] === 0 || h.y[i] === 1 ? h.y[i] : null))])), input.referenceEncoding ?? 'f32');
+        reference = { set, rows: decodeReference(set), index };
+    }
+    for (const { name, y: yIn, policy, prevalence, baseline, weak, maxWeakShare = 0.5, type = 'linear', dismissal } of input.heads) {
         checkLength(`${name}: y`, yIn, X.length);
+        checkLength(`${name}: dismissal.rows`, dismissal?.rows, X.length);
+        if (dismissal?.background && background)
+            checkLength(`${name}: dismissal.background`, dismissal.background, background.X.length);
+        if (dismissal && !(dismissal.maxRate > 0 && dismissal.maxRate < 1))
+            throw new Error(`${name}: dismissal.maxRate must be in (0, 1)`);
+        const cleared = (i) => !!dismissal?.rows[i];
         checkLength(`${name}: baseline`, baseline, X.length);
         if (records) {
             if (prevalence !== undefined)
@@ -138,8 +167,45 @@ export function trainHeads(input) {
             trainWeights = capped.weights;
             result.provenance.heads[name] = capped.summary;
         }
+        // Head type: knn and stack heads learn their layer on out-of-fold features of the training rows.
+        let fitted = null;
+        if (type !== 'linear') {
+            if (weak && weak.X.length)
+                throw new Error(`${name}: weak positives are supported for linear heads only`);
+            const t = {
+                rows: idx.train, y: ySplit('train'), weights: trainWeights, keys: idx.train.map(foldKey), X,
+                reference: reference.rows, referenceKeys: reference.index.map(foldKey), referenceLabels: reference.set.labels[name], C, seed,
+            };
+            let chosen = type === 'auto' ? 'linear' : type;
+            if (type === 'auto') {
+                const costs = {}, fits = {};
+                for (const ht of HEAD_TYPES) {
+                    fits[ht] = fitFeatures(ht, t);
+                    costs[ht] = guaranteeCost(crossValidatedScores(fits[ht], t), t.y, policy);
+                }
+                // Leave linear only for a clear cross-validated gain (autoMargin); ties go to the simpler type.
+                const bar = costs.linear * (1 - autoMargin);
+                chosen = HEAD_TYPES.filter((ht) => ht !== 'linear' && costs[ht] < bar - 1e-12).reduce((a, b) => (a === 'linear' || costs[b] < costs[a] - 1e-12 ? b : a), 'linear');
+                fitted = chosen === 'linear' ? null : fits[chosen];
+                const criterion = policy.kind === 'recall' ? `false alarms at recall ${policy.targetRecall}` : `recall lost at precision ${policy.targetPrecision}`;
+                result.headChoice[name] = { chosen, costs, criterion: `${criterion}, 3-fold cross-validated on the training rows; non-linear only below linear × ${1 - autoMargin}` };
+                log(`${name}: auto chose ${chosen} (${HEAD_TYPES.map((ht) => `${ht} ${costs[ht].toFixed(4)}`).join(', ')})`);
+            }
+            else
+                fitted = fitFeatures(chosen, t);
+        }
+        const trainAt = new Map(idx.train.map((i, n) => [i, n]));
+        const applied = new Map();
+        /** The head's input for row i of X: out-of-fold features for training rows. */
+        const rowFeatures = (i) => (!fitted ? X[i] : trainAt.has(i) ? fitted.train[trainAt.get(i)] : applied.get(i) ?? applied.set(i, fitted.apply(X[i])).get(i));
+        const features = (x) => (fitted ? fitted.apply(x) : x);
         let model;
-        if (weak && weak.X.length) {
+        if (fitted) {
+            model = fitLogistic(fitted.train, ySplit('train'), {
+                C, classWeight: 'balanced', ...(trainWeights.some((w) => w !== 1) ? { sampleWeight: trainWeights } : {}),
+            });
+        }
+        else if (weak && weak.X.length) {
             const gold = ySplit('train').reduce((a, b) => a + b, 0);
             const before = weak.weights.reduce((a, b) => a + b, 0);
             const scale = before > maxWeakShare * gold ? (maxWeakShare * gold) / before : 1;
@@ -166,19 +232,22 @@ export function trainHeads(input) {
                 C, classWeight: 'balanced', ...(trainWeights.some((w) => w !== 1) ? { sampleWeight: trainWeights } : {}),
             });
         }
-        const score = (x) => calibrate(calibration, decisionFunction(model, x));
+        const score = (x) => calibrate(calibration, decisionFunction(model, features(x)));
         const yCal = ySplit('calibration');
         // Sampled calibration: design weights 1/π (they reproduce production prevalence). Otherwise reweight to `prevalence`.
         const calDesign = records ? designOf(idx.calibration.map((i) => records[i])) : null;
         const wCal = calDesign ? calDesign.inclusionProbs.map((p) => 1 / p) : prevalenceWeights(yCal, prevalence);
         const unequal = !!calDesign && calDesign.inclusionProbs.some((p) => Math.abs(p - calDesign.inclusionProbs[0]) > 1e-12);
-        const calLogits = idx.calibration.map((i) => decisionFunction(model, X[i]));
+        const calLogits = idx.calibration.map((i) => decisionFunction(model, rowFeatures(i)));
+        // The calibrator sees the rows the dismissal rules leave to the classifier; cleared rows score 0.
+        const kept = idx.calibration.map((i) => !cleared(i));
+        const keep = (v) => v.filter((_, j) => kept[j]);
         const calibration = method === 'platt'
-            ? { method: 'platt', ...fitPlatt(calLogits, yCal, wCal) }
-            : { method: 'isotonic', ...fitIsotonic(calLogits.map(sigmoid), yCal, wCal, { yMin: 0, yMax: 1 }) };
-        const pCal = calLogits.map((z) => calibrate(calibration, z));
+            ? { method: 'platt', ...fitPlatt(keep(calLogits), keep(yCal), keep(wCal)) }
+            : { method: 'isotonic', ...fitIsotonic(keep(calLogits).map(sigmoid), keep(yCal), keep(wCal), { yMin: 0, yMax: 1 }) };
+        const pCal = calLogits.map((z, j) => (kept[j] ? calibrate(calibration, z) : 0));
         const budget = background?.maxRate[name];
-        const backgroundP = background && budget !== undefined ? background.X.map(score) : null;
+        const backgroundP = background && budget !== undefined ? background.X.map((x, j) => (dismissal?.background?.[j] ? 0 : score(x))) : null;
         const heuristic = () => {
             const t = pickThreshold(policy, pCal, yCal, calDesign ? wCal : undefined);
             return backgroundP && budget !== undefined ? budgetThreshold(t, backgroundP, budget) : t;
@@ -285,7 +354,7 @@ export function trainHeads(input) {
             const minFired = policy.designMinFired ?? 20;
             const reference = background && background.X.length
                 ? background.X.map((x) => score(x)).sort((a, b) => b - a)
-                : idx.train.map((i) => calibrate(calibration, decisionFunction(model, X[i]))).sort((a, b) => b - a);
+                : idx.train.map((i) => calibrate(calibration, decisionFunction(model, rowFeatures(i)))).sort((a, b) => b - a);
             const start = Math.min(reference.length - 1, Math.ceil((minFired * reference.length) / Math.max(1, idx.calibration.length)) - 1);
             const ranks = Array.from({ length: 150 }, (_, k) => start + Math.floor((k * (reference.length - 1 - start)) / 149));
             const candidates = [...new Set(ranks.map((r) => reference[r]))].sort((a, b) => b - a);
@@ -323,9 +392,16 @@ export function trainHeads(input) {
         if (policy.kind === 'precision' && policy.mode !== 'design' && !pCal.some((p) => p >= threshold)) {
             result.warnings.push(`${name}: no calibration example reaches the target precision ${threshold} - the head is unlikely ever to fire`);
         }
+        if (dismissal && !(threshold > 0)) {
+            // Firing at 0 would mean firing on messages the rules cleared, which are never scored.
+            result.failures.push(`${name}: the target needs messages the dismissal rules cleared to fire - certify fewer dismissal rules`);
+            threshold = nextUp(1);
+            if (guarantee)
+                guarantee = { mode: guarantee.mode, kind: 'none', alpha: guarantee.alpha, ...(guarantee.metric ? { metric: guarantee.metric } : {}) };
+        }
         const reviewFloor = reviewEpsilon === undefined ? threshold * reviewRatio : Math.min(threshold, conformalLowerThreshold(positives, reviewEpsilon) ?? 0);
         const yTest = ySplit('test');
-        const pTest = idx.test.map((i) => score(X[i]));
+        const pTest = idx.test.map((i) => (cleared(i) ? 0 : calibrate(calibration, decisionFunction(model, rowFeatures(i)))));
         const atTest = (values) => idx.test.map((i) => values[i]);
         const testDesign = records ? designOf(idx.test.map((i) => records[i])) : null;
         const ev = evaluateHead({
@@ -353,10 +429,18 @@ export function trainHeads(input) {
         result.failures.push(...gates.failures.map((f) => `${name}: ${f}`));
         result.warnings.push(...gates.warnings.map((w) => `${name}: ${w}`));
         result.heads[name] = {
-            weights: model.coef, bias: model.intercept, calibration, threshold, review_floor: reviewFloor,
+            weights: model.coef, bias: model.intercept, ...(fitted?.features ? { features: fitted.features } : {}), calibration, threshold, review_floor: reviewFloor,
+            ...(dismissal ? { dismissal: { rule_set: dismissal.ruleSet, max_rate: dismissal.maxRate, certified: dismissal.certified } } : {}),
             ...(guarantee ? { guarantee } : {}), ...(reviewEpsilon !== undefined ? { review_epsilon: reviewEpsilon } : {}),
         };
-        result.testProbabilities[name] = { idx: idx.test, p: pTest };
+        // Round-trip checks score embeddings, so rows the rules cleared (never scored at runtime) are left out.
+        result.testProbabilities[name] = { idx: idx.test.filter((i) => !cleared(i)), p: pTest.filter((_, j) => !cleared(idx.test[j])) };
+    }
+    // Keep the reference only for heads that use it (auto may have chosen linear everywhere).
+    if (reference) {
+        const using = Object.entries(result.heads).filter(([, spec]) => spec.features).map(([h]) => h);
+        if (using.length)
+            result.reference = { ...reference.set, labels: Object.fromEntries(using.map((h) => [h, reference.set.labels[h]])) };
     }
     return result;
 }

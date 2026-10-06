@@ -19,9 +19,10 @@ import { clopperPearsonUpper, conformalLowerThreshold, conformalRank, decisionFu
 import { designOf, type DesignSummary } from './design.ts';
 import { capTrainingWeights, validateProvenance, type ExampleRecord, type ProvenanceCode, type ProvenanceOptions, type WeightCaps, type WeightCapSummary } from './records.ts';
 import { conformalThreshold, groupScores, type FalseAlarmConstraint, type Guarantee, type Sufficiency } from './conformal.ts';
-import { calibrate, scoreEmbedding, validateArtifact, type Calibration, type ClassifierArtifact, type HeadSpec } from './artifact.ts';
+import { calibrate, scoreEmbedding, validateArtifact, type Calibration, type ClassifierArtifact, type EmbeddingSpec, type HeadSpec } from './artifact.ts';
 import { evaluateHead, type HeadEvaluation } from './evaluate.ts';
 import { gateHead } from './gates.ts';
+import { crossValidatedScores, decodeReference, encodeReference, fitFeatures, guaranteeCost, HEAD_TYPES, type FeatureTraining, type FittedFeatures, type HeadType, type ReferenceSet } from './heads.ts';
 import { budgetThreshold, falseAlarmCap, pickThreshold, type HeadPolicy } from './threshold.ts';
 
 export const SPLITS = ['train', 'calibration', 'test'] as const;
@@ -41,6 +42,22 @@ export interface HeadInput<H extends string> {
   safetyCritical?: boolean;
   /** Whether an existing mechanism already catches each example (see evaluateHead). */
   baseline?: readonly boolean[];
+  /**
+   * The head's type (default 'linear': today's head). 'knn' and 'stack' score against the artifact's
+   * shared reference of training embeddings (see heads.ts; store result.reference as
+   * artifact.reference); 'auto' picks the type with the lowest cross-validated guarantee cost on the
+   * training rows (recorded in result.headChoice). Calibration, thresholds and guarantees are the same
+   * for every type. Non-linear types need X to be the embeddings, and don't take weak positives.
+   */
+  type?: HeadType | 'auto';
+  /**
+   * Certified dismissal rules in front of this head (rule-miner's mineDismissals and
+   * certifyDismissals): `rows` marks the rows of X a rule cleared (and `background` the rows of
+   * background.X). Cleared calibration, test and background rows score 0, so a positive a rule
+   * dismissed counts as a miss: the head's recall guarantee covers rules and classifier together.
+   * Training is unchanged; calibration is fitted on the rows the rules leave to the classifier.
+   */
+  dismissal?: { rows: readonly boolean[]; background?: readonly boolean[]; ruleSet: string; maxRate: number; certified: number };
   /**
    * Extra POSITIVES for the train split only, e.g. rule-miner's weakLabels(): embeddings with a
    * weight in [0, 1] each. They never reach calibration, test or the background budget, and an
@@ -134,8 +151,29 @@ export interface TrainInput<H extends string> {
    * embeddings with extra columns - since cosine similarity between those isn't about the text.
    */
   provenanceEmbeddings?: { X: ReadonlyArray<ArrayLike<number>>; background?: ReadonlyArray<ArrayLike<number>> };
-  /** Seed for design bootstraps (default 0). */
+  /** Seed for design bootstraps and the stack head's principal components (default 0). */
   seed?: number;
+  /**
+   * Cross-fitting folds for knn, stack and auto heads: rows with the same key share a fold (default:
+   * `groups`, else the row index). Keep near-duplicates together, or a training row's out-of-fold
+   * score still finds its twin.
+   */
+  foldKeys?: readonly string[];
+  /**
+   * type 'auto': a knn or stack head is chosen only when its cross-validated cost is below the linear
+   * head's × (1 − autoMargin) (default 0.2), then the cheaper of the two. Cross-validated costs on a
+   * small training split are noisy; without a margin, near-ties often pick a non-linear head that does
+   * worse on new traffic. A relative margin keeps the clear wins and drops the near-ties.
+   */
+  autoMargin?: number;
+  /**
+   * A fit that stopped short of its tolerance (the head's logistic model, a stack's linear component,
+   * or the Platt calibrator - the likeliest, on a small calibration split the scores separate) is a
+   * warning by default; true makes it a gate failure. result.convergence records every head's fits.
+   */
+  requireConvergence?: boolean;
+  /** Encoding of the knn reference (default 'f32'): 'int8' is about 4× smaller, with essentially the same results. */
+  referenceEncoding?: 'f32' | 'int8';
   log?: (line: string) => void;
 }
 
@@ -161,8 +199,21 @@ export interface TrainResult<H extends string> {
   weakLabels: Partial<Record<H, WeakSummary>>;
   /** With records: provenance enforcement - store as artifact.training.provenance. */
   provenance?: ProvenanceSummary;
+  /** Training embeddings for knn and stack heads - store as artifact.reference (scoreEmbedding needs it). */
+  reference?: ReferenceSet;
+  /** Whether each head's fits converged: its model (and a stack's linear component), and its Platt calibrator. */
+  convergence: Partial<Record<H, { model: boolean; calibration: boolean }>>;
+  /** Heads trained with type 'auto': each type's cross-validated cost and the choice - store as artifact.training.head_choice. */
+  headChoice: Partial<Record<H, HeadChoice>>;
   /** With sampled records: the designs and each head's estimator - store as artifact.training.design. */
   design?: { designs: DesignSummary[]; heads: Record<string, { calibration: 'design-weighted'; threshold: string; evaluation: 'design-linearised' }> };
+}
+
+export interface HeadChoice {
+  chosen: HeadType;
+  /** Out-of-fold guarantee cost per type on the training rows (lower is better). */
+  costs: Record<HeadType, number>;
+  criterion: string;
 }
 
 function checkLength(name: string, values: { length: number } | undefined, n: number): void {
@@ -183,7 +234,7 @@ function indicesBySplit(split: readonly Split[], y: ReadonlyArray<0 | 1 | null>)
 }
 
 export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<H> {
-  const { X, split, C = 1, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, groups, slices, background, records, seed = 0, log = () => {} } = input;
+  const { X, split, C = 1, autoMargin = 0.2, requireConvergence = false, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, groups, slices, background, records, seed = 0, log = () => {} } = input;
   checkLength('split', split, X.length);
   split.forEach((s, i) => {
     if (!(SPLITS as readonly string[]).includes(s)) throw new Error(`split[${i}] is "${s}", expected one of ${SPLITS.join(', ')}`);
@@ -192,8 +243,11 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
   for (const [field, values] of Object.entries(slices ?? {})) checkLength(`slices.${field}`, values, X.length);
   if (background && Object.keys(background.maxRate).length && background.X.length === 0) throw new Error('background.X must be non-empty when a maxRate is set');
   if (!(reviewRatio >= 0 && reviewRatio <= 1)) throw new Error('reviewRatio must be between 0 and 1');
+  if (!(autoMargin >= 0 && autoMargin < 1)) throw new Error('autoMargin must be in [0, 1)');
   if (reviewEpsilon !== undefined && !(reviewEpsilon > 0 && reviewEpsilon < 1)) throw new Error('reviewEpsilon must be strictly between 0 and 1');
-  const result: TrainResult<H> = { heads: {}, evaluation: {}, failures: [], warnings: [], testProbabilities: {}, weakLabels: {} };
+  const result: TrainResult<H> = { heads: {}, evaluation: {}, failures: [], warnings: [], testProbabilities: {}, weakLabels: {}, headChoice: {}, convergence: {} };
+  checkLength('foldKeys', input.foldKeys, X.length);
+  const foldKey = (i: number) => input.foldKeys?.[i] ?? groups?.[i] ?? `#${i}`;
 
   // Provenance: validate every record, drop P5 near-duplicates from training, record overrides.
   const excluded = new Set<number>();
@@ -232,8 +286,29 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
     return heldOut.has(vectorKey(x));
   };
 
-  for (const { name, y: yIn, policy, prevalence, baseline, weak, maxWeakShare = 0.5 } of input.heads) {
+  // The shared reference for knn, stack and auto heads: training rows labelled for any of them.
+  // Generated records (synthetic text) are left out; retrieved ones are human-labelled and stay.
+  const nonLinear = input.heads.filter((h) => (h.type ?? 'linear') !== 'linear');
+  let reference: { set: ReferenceSet; rows: Float32Array[]; index: number[] } | null = null;
+  if (nonLinear.length) {
+    for (const h of nonLinear) {
+      if (!(h.type === 'auto' || HEAD_TYPES.includes(h.type as HeadType))) throw new Error(`${h.name}: unknown head type ${h.type}`);
+      checkLength(`${h.name}: y`, h.y, X.length);
+    }
+    const generated = new Set(records ? records.flatMap((r, i) => (r.source.kind === 'generated' ? [i] : [])) : []);
+    const index = X.map((_, i) => i).filter((i) => split[i] === 'train' && !excluded.has(i) && !generated.has(i) && nonLinear.some((h) => h.y[i] === 0 || h.y[i] === 1));
+    const leftOut = X.filter((_, i) => split[i] === 'train' && generated.has(i)).length;
+    if (leftOut) result.warnings.push(`reference: ${leftOut} generated training record(s) left out of the knn reference`);
+    const set = encodeReference(index.map((i) => X[i]), Object.fromEntries(nonLinear.map((h) => [h.name, index.map((i) => (h.y[i] === 0 || h.y[i] === 1 ? h.y[i] : null))])), input.referenceEncoding ?? 'f32');
+    reference = { set, rows: decodeReference(set), index };
+  }
+
+  for (const { name, y: yIn, policy, prevalence, baseline, weak, maxWeakShare = 0.5, type = 'linear', dismissal } of input.heads) {
     checkLength(`${name}: y`, yIn, X.length);
+    checkLength(`${name}: dismissal.rows`, dismissal?.rows, X.length);
+    if (dismissal?.background && background) checkLength(`${name}: dismissal.background`, dismissal.background, background.X.length);
+    if (dismissal && !(dismissal.maxRate > 0 && dismissal.maxRate < 1)) throw new Error(`${name}: dismissal.maxRate must be in (0, 1)`);
+    const cleared = (i: number) => !!dismissal?.rows[i];
     checkLength(`${name}: baseline`, baseline, X.length);
     if (records) {
       if (prevalence !== undefined) throw new Error(`${name}: don't pass prevalence with sampled records - calibration is weighted by 1/π, which already reproduces production prevalence; weighting to prevalence as well would count it twice`);
@@ -266,8 +341,39 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
       trainWeights = capped.weights;
       result.provenance!.heads[name] = capped.summary;
     }
+    // Head type: knn and stack heads learn their layer on out-of-fold features of the training rows.
+    let fitted: FittedFeatures | null = null;
+    if (type !== 'linear') {
+      if (weak && weak.X.length) throw new Error(`${name}: weak positives are supported for linear heads only`);
+      const t: FeatureTraining = {
+        rows: idx.train, y: ySplit('train') as Array<0 | 1>, weights: trainWeights, keys: idx.train.map(foldKey), X,
+        reference: reference!.rows, referenceKeys: reference!.index.map(foldKey), referenceLabels: reference!.set.labels[name], C, seed,
+      };
+      let chosen: HeadType = type === 'auto' ? 'linear' : type;
+      if (type === 'auto') {
+        const costs = {} as Record<HeadType, number>, fits = {} as Record<HeadType, FittedFeatures>;
+        for (const ht of HEAD_TYPES) { fits[ht] = fitFeatures(ht, t); costs[ht] = guaranteeCost(crossValidatedScores(fits[ht], t), t.y, policy); }
+        // Leave linear only for a clear cross-validated gain (autoMargin); ties go to the simpler type.
+        const bar = costs.linear * (1 - autoMargin);
+        chosen = HEAD_TYPES.filter((ht) => ht !== 'linear' && costs[ht] < bar - 1e-12).reduce<HeadType>((a, b) => (a === 'linear' || costs[b] < costs[a] - 1e-12 ? b : a), 'linear');
+        fitted = chosen === 'linear' ? null : fits[chosen];
+        const criterion = policy.kind === 'recall' ? `false alarms at recall ${policy.targetRecall}` : `recall lost at precision ${policy.targetPrecision}`;
+        result.headChoice[name] = { chosen, costs, criterion: `${criterion}, 3-fold cross-validated on the training rows; non-linear only below linear × ${1 - autoMargin}` };
+        log(`${name}: auto chose ${chosen} (${HEAD_TYPES.map((ht) => `${ht} ${costs[ht].toFixed(4)}`).join(', ')})`);
+      } else fitted = fitFeatures(chosen, t);
+    }
+    const trainAt = new Map(idx.train.map((i, n) => [i, n]));
+    const applied = new Map<number, number[]>();
+    /** The head's input for row i of X: out-of-fold features for training rows. */
+    const rowFeatures = (i: number): ArrayLike<number> => (!fitted ? X[i] : trainAt.has(i) ? fitted.train[trainAt.get(i)!] : applied.get(i) ?? applied.set(i, fitted.apply(X[i])).get(i)!);
+    const features = (x: ArrayLike<number>): ArrayLike<number> => (fitted ? fitted.apply(x) : x);
+
     let model;
-    if (weak && weak.X.length) {
+    if (fitted) {
+      model = fitLogistic(fitted.train, ySplit('train'), {
+        C, classWeight: 'balanced', ...(trainWeights.some((w) => w !== 1) ? { sampleWeight: trainWeights } : {}),
+      });
+    } else if (weak && weak.X.length) {
       const gold = ySplit('train').reduce((a, b) => a + b, 0);
       const before = weak.weights.reduce((a, b) => a + b, 0);
       const scale = before > maxWeakShare * gold ? (maxWeakShare * gold) / before : 1;
@@ -292,21 +398,33 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
         C, classWeight: 'balanced', ...(trainWeights.some((w) => w !== 1) ? { sampleWeight: trainWeights } : {}),
       });
     }
-    const score = (x: ArrayLike<number>) => calibrate(calibration, decisionFunction(model, x));
+    const score = (x: ArrayLike<number>) => calibrate(calibration, decisionFunction(model, features(x)));
 
     const yCal = ySplit('calibration');
     // Sampled calibration: design weights 1/π (they reproduce production prevalence). Otherwise reweight to `prevalence`.
     const calDesign = records ? designOf(idx.calibration.map((i) => records[i])) : null;
     const wCal = calDesign ? calDesign.inclusionProbs.map((p) => 1 / p) : prevalenceWeights(yCal, prevalence!);
     const unequal = !!calDesign && calDesign.inclusionProbs.some((p) => Math.abs(p - calDesign.inclusionProbs[0]) > 1e-12);
-    const calLogits = idx.calibration.map((i) => decisionFunction(model, X[i]));
-    const calibration: Calibration =
-      method === 'platt'
-        ? { method: 'platt', ...fitPlatt(calLogits, yCal, wCal) }
-        : { method: 'isotonic', ...fitIsotonic(calLogits.map(sigmoid), yCal, wCal, { yMin: 0, yMax: 1 }) };
-    const pCal = calLogits.map((z) => calibrate(calibration, z));
+    const calLogits = idx.calibration.map((i) => decisionFunction(model, rowFeatures(i)));
+    // The calibrator sees the rows the dismissal rules leave to the classifier; cleared rows score 0.
+    const kept = idx.calibration.map((i) => !cleared(i));
+    const keep = <T>(v: readonly T[]) => v.filter((_, j) => kept[j]);
+    let calibrationConverged = true;
+    let calibration: Calibration;
+    if (method === 'platt') {
+      const { a, c, converged } = fitPlatt(keep(calLogits), keep(yCal), keep(wCal));
+      calibration = { method: 'platt', a, c };
+      calibrationConverged = converged;
+    } else calibration = { method: 'isotonic', ...fitIsotonic(keep(calLogits).map(sigmoid), keep(yCal), keep(wCal), { yMin: 0, yMax: 1 }) };
+    // Convergence: a fit that stopped short of its tolerance is reported (a failure with requireConvergence).
+    const modelConverged = model.converged && (fitted?.converged ?? true);
+    result.convergence[name] = { model: modelConverged, calibration: calibrationConverged };
+    for (const [what, ok] of [['logistic model', modelConverged], ['Platt calibrator (the calibration scores may separate the classes)', calibrationConverged]] as const) {
+      if (!ok) (requireConvergence ? result.failures : result.warnings).push(`${name}: the ${what} did not converge`);
+    }
+    const pCal = calLogits.map((z, j) => (kept[j] ? calibrate(calibration, z) : 0));
     const budget = background?.maxRate[name];
-    const backgroundP = background && budget !== undefined ? background.X.map(score) : null;
+    const backgroundP = background && budget !== undefined ? background.X.map((x, j) => (dismissal?.background?.[j] ? 0 : score(x))) : null;
     const heuristic = () => {
       const t = pickThreshold(policy, pCal, yCal, calDesign ? wCal : undefined);
       return backgroundP && budget !== undefined ? budgetThreshold(t, backgroundP, budget) : t;
@@ -323,7 +441,14 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
     // Every background rank a threshold could have been capped at - for a bound valid whichever applied.
     const backgroundRanks: number[] = [];
     if (backgroundP && budget !== undefined && Math.floor(budget * backgroundP.length) < backgroundP.length) backgroundRanks.push(Math.floor(budget * backgroundP.length));
-    const mode = policy.kind === 'recall' ? policy.mode ?? 'heuristic' : 'heuristic';
+    // Default: the strongest guarantee the data supports - 'design' with sampled calibration records,
+    // else 'auto' (conformal) without the silent heuristic fallback. 'heuristic' only when chosen.
+    const mode = policy.kind === 'recall' ? policy.mode ?? (calDesign ? 'design' : 'auto') : 'heuristic';
+    const precisionMode = policy.kind === 'precision' ? policy.mode ?? (calDesign ? 'design' : undefined) : undefined;
+    const allowHeuristic = policy.kind === 'recall'
+      ? policy.allowHeuristicFallback ?? (policy.fallback !== undefined ? policy.fallback === 'heuristic' : policy.mode !== undefined)
+      : false;
+    if (policy.kind === 'recall' && policy.fallback === 'heuristic' && policy.designRecall === undefined) throw new Error(`${name}: fallback 'heuristic' needs designRecall (the heuristic threshold's target)`);
     if (unequal && (mode === 'conformal-expected' || mode === 'conformal-pac' || mode === 'auto' || reviewEpsilon !== undefined)) {
       throw new Error(`${name}: the calibration records have unequal inclusion probabilities, so they aren't exchangeable and conformal guarantees${reviewEpsilon !== undefined ? ' (including reviewEpsilon)' : ''} don't hold - use mode 'design'`);
     }
@@ -350,6 +475,11 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
           }
         }
         log(`${name}: design threshold ${threshold} (${res.guarantee}, ${designMethod}, Kish effective positives ${res.nEff.toFixed(1)})`);
+      } else if (policy.fallback === 'heuristic') {
+        // Too little evidence for the guarantee, and the policy chose a heuristic threshold for that case.
+        threshold = heuristic();
+        guarantee = { mode, kind: 'none', alpha: 1 - policy.targetRecall, fallback: 'heuristic' };
+        result.warnings.push(`${name}: design: ${res.reason}; heuristic threshold (fallback), no guarantee - a guarantee needs at least ${minimumSamples(1 - policy.targetRecall, delta)} effective calibration positives with no misses (have ${res.nEff.toFixed(1)})`);
       } else {
         fails.push(`design: ${res.reason}`);
         threshold = nextUp(1); // never fires: no threshold is substituted silently
@@ -364,7 +494,7 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
         constraints.push({ name: 'calibration false-alarm', scores: groupScores(ofClass(0)(pCal), calGroups && ofClass(0)(calGroups), Math.max), maxRate: policy.maxFalseAlarm });
       }
       if (backgroundP && budget !== undefined) constraints.push({ name: 'background', scores: backgroundP, maxRate: budget });
-      const sel = conformalThreshold({ mode: mode as 'conformal-expected' | 'conformal-pac' | 'auto', targetRecall: policy.targetRecall, delta, positives, constraints, heuristicAvailable: policy.designRecall !== undefined, allowHeuristic: policy.allowHeuristicFallback });
+      const sel = conformalThreshold({ mode: mode as 'conformal-expected' | 'conformal-pac' | 'auto', targetRecall: policy.targetRecall, delta, positives, constraints, heuristicAvailable: policy.designRecall !== undefined, allowHeuristic });
       if (backgroundP && budget !== undefined) {
         for (const d of [undefined, delta / (1 + constraints.length)]) backgroundRanks.push(conformalRank(backgroundP.length, budget, d));
       }
@@ -373,7 +503,7 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
         sel.guarantee = { mode, kind: 'none', alpha: sel.guarantee.alpha };
       }
       threshold = sel.threshold ?? heuristic();
-      guarantee = sel.guarantee;
+      guarantee = sel.threshold === null ? { ...sel.guarantee, kind: 'none', fallback: 'heuristic' } : sel.guarantee;
       sufficiency = sel.sufficiency;
       sufficiency.chosen = sel.threshold === null ? 'heuristic' : sufficiency.chosen;
       if (slices) {
@@ -392,7 +522,7 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
       result.failures.push(...sel.failures.map((f) => `${name}: ${f}`));
       result.warnings.push(...sel.warnings.map((w) => `${name}: ${w}`));
       log(`${name}: ${mode} threshold ${threshold} (${guarantee.kind} guarantee, ${positives.length} calibration positive groups)`);
-    } else if (policy.kind === 'precision' && policy.mode === 'design') {
+    } else if (policy.kind === 'precision' && precisionMode === 'design') {
       if (!calDesign) throw new Error(`${name}: precision mode 'design' needs sampled calibration records (records)`);
       const designMethod = policy.designMethod ?? 'linearised';
       // Candidates fixed before calibration: training-split logits (evenly spaced ranks from the 30th
@@ -404,7 +534,7 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
       const minFired = policy.designMinFired ?? 20;
       const reference = background && background.X.length
         ? background.X.map((x) => score(x)).sort((a, b) => b - a)
-        : idx.train.map((i) => calibrate(calibration, decisionFunction(model, X[i]))).sort((a, b) => b - a);
+        : idx.train.map((i) => calibrate(calibration, decisionFunction(model, rowFeatures(i)))).sort((a, b) => b - a);
       const start = Math.min(reference.length - 1, Math.ceil((minFired * reference.length) / Math.max(1, idx.calibration.length)) - 1);
       const ranks = Array.from({ length: 150 }, (_, k) => start + Math.floor((k * (reference.length - 1 - start)) / 149));
       const candidates = [...new Set(ranks.map((r) => reference[r]))].sort((a, b) => b - a);
@@ -423,6 +553,11 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
           if (Math.floor(budget * backgroundP.length) < backgroundP.length) backgroundRanks.push(Math.floor(budget * backgroundP.length));
         }
         log(`${name}: design precision threshold ${threshold} (${res.guarantee}, ${designMethod}, ${res.firedEffective.toFixed(1)} effective fired)`);
+      } else if (policy.fallback === 'heuristic') {
+        // Too little evidence for the guarantee, and the policy chose a heuristic threshold for that case.
+        result.warnings.push(`${name}: design: ${res.reason}; heuristic threshold (fallback), no guarantee`);
+        threshold = heuristic();
+        guarantee = { mode: 'design', kind: 'none', alpha, metric: 'precision', fallback: 'heuristic' };
       } else {
         result.failures.push(`${name}: design: ${res.reason}`);
         threshold = nextUp(1);
@@ -432,15 +567,28 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
     } else {
       threshold = heuristic();
       if (policy.kind === 'recall') guarantee = { mode: 'heuristic', kind: 'none', alpha: 1 - policy.targetRecall };
+      if (policy.kind === 'precision' && precisionMode === undefined && policy.fallback !== 'heuristic') {
+        // No guarantee is possible here, and none was waived: the head may ship only in shadow mode.
+        result.failures.push(`${name}: no precision guarantee without sampled calibration records - pass records (mode 'design'), or set mode 'heuristic' (or fallback 'heuristic') to accept an unguaranteed threshold`);
+      } else if (policy.kind === 'precision' && precisionMode === undefined) {
+        guarantee = { mode: 'heuristic', kind: 'none', alpha: 1 - policy.targetPrecision, metric: 'precision', fallback: 'heuristic' };
+        result.warnings.push(`${name}: no sampled calibration records, so no precision guarantee: heuristic threshold (fallback)`);
+      } else result.warnings.push(`${name}: mode 'heuristic' was chosen - the threshold carries no guarantee`);
     }
     if (records && !result.design!.heads[name]) result.design!.heads[name] = { calibration: 'design-weighted', threshold: mode, evaluation: 'design-linearised' };
-    if (policy.kind === 'precision' && policy.mode !== 'design' && !pCal.some((p) => p >= threshold)) {
+    if (policy.kind === 'precision' && precisionMode !== 'design' && !pCal.some((p) => p >= threshold)) {
       result.warnings.push(`${name}: no calibration example reaches the target precision ${threshold} - the head is unlikely ever to fire`);
+    }
+    if (dismissal && !(threshold > 0)) {
+      // Firing at 0 would mean firing on messages the rules cleared, which are never scored.
+      result.failures.push(`${name}: the target needs messages the dismissal rules cleared to fire - certify fewer dismissal rules`);
+      threshold = nextUp(1);
+      if (guarantee) guarantee = { mode: guarantee.mode, kind: 'none', alpha: guarantee.alpha, ...(guarantee.metric ? { metric: guarantee.metric } : {}) };
     }
     const reviewFloor = reviewEpsilon === undefined ? threshold * reviewRatio : Math.min(threshold, conformalLowerThreshold(positives, reviewEpsilon) ?? 0);
 
     const yTest = ySplit('test');
-    const pTest = idx.test.map((i) => score(X[i]));
+    const pTest = idx.test.map((i) => (cleared(i) ? 0 : calibrate(calibration, decisionFunction(model, rowFeatures(i)))));
     const atTest = <T>(values: readonly T[]) => idx.test.map((i) => values[i]);
     const testDesign = records ? designOf(idx.test.map((i) => records[i])) : null;
     const ev = evaluateHead({
@@ -466,10 +614,17 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
     result.failures.push(...gates.failures.map((f) => `${name}: ${f}`));
     result.warnings.push(...gates.warnings.map((w) => `${name}: ${w}`));
     result.heads[name] = {
-      weights: model.coef, bias: model.intercept, calibration, threshold, review_floor: reviewFloor,
+      weights: model.coef, bias: model.intercept, ...(fitted?.features ? { features: fitted.features } : {}), calibration, threshold, review_floor: reviewFloor,
+      ...(dismissal ? { dismissal: { rule_set: dismissal.ruleSet, max_rate: dismissal.maxRate, certified: dismissal.certified } } : {}),
       ...(guarantee ? { guarantee } : {}), ...(reviewEpsilon !== undefined ? { review_epsilon: reviewEpsilon } : {}),
     };
-    result.testProbabilities[name] = { idx: idx.test, p: pTest };
+    // Round-trip checks score embeddings, so rows the rules cleared (never scored at runtime) are left out.
+    result.testProbabilities[name] = { idx: idx.test.filter((i) => !cleared(i)), p: pTest.filter((_, j) => !cleared(idx.test[j])) };
+  }
+  // Keep the reference only for heads that use it (auto may have chosen linear everywhere).
+  if (reference) {
+    const using = Object.entries(result.heads).filter(([, spec]) => (spec as HeadSpec).features).map(([h]) => h);
+    if (using.length) result.reference = { ...reference.set, labels: Object.fromEntries(using.map((h) => [h, reference!.set.labels[h]])) };
   }
   return result;
 }
@@ -506,3 +661,28 @@ export function assertRoundTrip<H extends string>(
     });
   }
 }
+
+/**
+ * The artifact for a training result, with its gates taken from the result (passed exactly when no
+ * gate failed), so they are never set by hand. Also records the reference, head choices, convergence,
+ * provenance, design and weak-label summaries. Serve it through validateArtifact(raw, { mode }).
+ */
+export function buildArtifact<H extends string>(result: TrainResult<H>, options: { version: string; embedding: EmbeddingSpec; createdAt?: string; training?: Record<string, unknown> }): ClassifierArtifact<H> {
+  const training: Record<string, unknown> = { ...(options.training ?? {}) };
+  if (Object.keys(result.headChoice).length) training.head_choice = result.headChoice;
+  if (Object.keys(result.convergence).length) training.convergence = result.convergence;
+  if (Object.keys(result.weakLabels).length) training.weak_labels = result.weakLabels;
+  if (result.provenance) training.provenance = result.provenance;
+  if (result.design) training.design = result.design;
+  return {
+    version: options.version,
+    created_at: options.createdAt ?? new Date().toISOString(),
+    embedding: options.embedding,
+    heads: result.heads,
+    ...(result.reference ? { reference: result.reference } : {}),
+    training,
+    evaluation: result.evaluation as Record<string, unknown>,
+    gates: { passed: result.failures.length === 0, failures: [...result.failures], warnings: [...result.warnings] },
+  };
+}
+

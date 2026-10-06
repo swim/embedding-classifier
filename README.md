@@ -28,17 +28,17 @@ npm install @liquidau/embedding-classifier
 ## Example
 
 ```ts
-import { decide, scoreEmbedding, trainHeads, type ClassifierArtifact, type Split } from '@liquidau/embedding-classifier';
+import { buildArtifact, decide, scoreEmbedding, trainHeads, validateArtifact, type Split } from '@liquidau/embedding-classifier';
 
 // Toy data: 900 two-dimensional "embeddings"; urgent ones sit up and to the right.
 const y = Array.from({ length: 900 }, (_, i) => (i % 10 === 0 ? 1 : 0) as 0 | 1);
 const X = y.map((v, i) => [2 * v + Math.sin(i), 2 * v + Math.cos(1.7 * i)]);
 const split = y.map((_, i): Split => (['train', 'calibration', 'test'] as const)[i % 3]);
 
-const result = trainHeads({ X, split, heads: [{ name: 'urgent', y, prevalence: 0.1, policy: { kind: 'recall', targetRecall: 0.9, designRecall: 0.95 } }] });
-console.log(result.failures); // [] when every release gate passed
+const result = trainHeads({ X, split, heads: [{ name: 'urgent', y, prevalence: 0.1, policy: { kind: 'recall', targetRecall: 0.9 } }] });
+console.log(result.failures, result.heads.urgent!.guarantee); // [] and a PAC recall guarantee (the default: the strongest the data supports)
 
-const artifact: ClassifierArtifact = { version: '1', created_at: '2026-10-03', embedding: { model_id: 'toy', dimensions: 2, normalize: false }, heads: result.heads };
+const artifact = validateArtifact(buildArtifact(result, { version: '1', embedding: { model_id: 'toy', dimensions: 2, normalize: false } }), { mode: 'enforce' });
 console.log(decide(artifact, scoreEmbedding(artifact, [2.1, 1.9]), { priority: ['urgent'] })); // { head: 'urgent', reason: 'above_threshold' }
 ```
 
@@ -76,7 +76,7 @@ A two-head version with a rules baseline, slices and gates is in [docs/EXAMPLE.m
 - Threshold guarantees hold only if calibration examples resemble production traffic.
 - Use the same embedding model and `truncateText` at training and at runtime.
 - One linear head per label, binary.
-- `CachedEmbedder` is in the `/embedder` subpath and is Node only.
+- The package root runs on any runtime, edge included; `CachedEmbedder` (`/embedder`) is Node only.
 
 ## What is deliberately not here
 
@@ -90,6 +90,7 @@ between training and runtime), the baseline, the decision policy, and what happe
 - [docs/THRESHOLDS.md](docs/THRESHOLDS.md): modes, sufficiency, certified bounds, review floor, gates.
 - [docs/DATA.md](docs/DATA.md): records and rules P1–P7, sampling, labelling, retrieval, coverage.
 - [docs/EXAMPLE.md](docs/EXAMPLE.md): the full two-head example.
+- [docs/SERVING.md](docs/SERVING.md): serving on serverless and edge runtimes, rules first.
 
 ## Develop
 

@@ -1,4 +1,4 @@
-export { calibrate, checkRuleSetPairing, headProbability, scoreEmbedding, validateArtifact } from "./artifact.js";
+export { calibrate, checkEmbeddingSpec, checkRuleSetPairing, headProbability, scoreEmbedding, validateArtifact } from "./artifact.js";
 export { decide, missingPolicyHeads, settleWithRules } from "./decide.js";
 export { budgetThreshold, falseAlarmCap, nextUp, pickThreshold } from "./threshold.js";
 export { evaluateHead } from "./evaluate.js";

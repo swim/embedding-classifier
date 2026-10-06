@@ -51,6 +51,33 @@ export interface EmbeddingSpec {
   normalize: boolean;
   /** Provider-specific input type, e.g. Cohere's "classification" - part of what the vectors mean. */
   input_type?: string;
+  /**
+   * Multi-layer features: the model's transformer layers (1-based, in concatenation order) whose token
+   * states are pooled and concatenated, e.g. [4, 8, 12]. Absent: the model's standard sentence
+   * embedding. `dimensions` is then the layers' total width.
+   */
+  layers?: number[];
+  /** With `layers`: how each layer's token states are pooled ('mean' over the attention mask). */
+  pooling?: 'mean';
+  /** With `layers`: whether each pooled layer is unit-normalised before concatenation. */
+  layer_normalize?: boolean;
+  /** The numeric precision of the model that produced the vectors, e.g. 'fp32' or 'q8': quantisation changes them. */
+  precision?: string;
+  /** Characters kept per text before tokenising (`truncateText`); use the same value at runtime. */
+  max_chars?: number;
+}
+
+/**
+ * How a runtime's embedder differs from the one the artifact's heads were trained on (empty when they
+ * match). Vectors of the right width can still mean something else - another layer set, precision or
+ * input type - and heads scored on them carry no guarantee, so refuse to serve while this is non-empty.
+ */
+export function checkEmbeddingSpec(artifact: Pick<ClassifierArtifact, 'embedding'>, runtime: EmbeddingSpec): string[] {
+  const a = artifact.embedding;
+  const fields = ['model_id', 'dimensions', 'normalize', 'input_type', 'layers', 'pooling', 'layer_normalize', 'precision', 'max_chars'] as const;
+  return fields
+    .filter((f) => JSON.stringify(a[f] ?? null) !== JSON.stringify(runtime[f] ?? null))
+    .map((f) => `embedding ${f}: the artifact was trained with ${JSON.stringify(a[f] ?? null)}, the runtime gives ${JSON.stringify(runtime[f] ?? null)}`);
 }
 
 export interface GateResult {
@@ -109,6 +136,16 @@ export function validateArtifact<H extends string = string>(raw: unknown, option
   if (options.mode === 'enforce' && a.gates?.passed !== true) throw new Error('refusing to enforce an artifact whose gates did not pass (or were not recorded): serve it in shadow mode, or retrain');
   const dims = a.embedding.dimensions;
   if (!Number.isInteger(dims) || dims < 1) throw new Error(`embedding dimensions must be a positive integer, got ${dims}`);
+  const { layers, pooling, layer_normalize: layerNormalize, max_chars: maxChars } = a.embedding;
+  if (layers !== undefined) {
+    if (!Array.isArray(layers) || !layers.length || !layers.every((l) => Number.isInteger(l) && l >= 1) || new Set(layers).size !== layers.length) {
+      throw new Error('embedding layers must be distinct positive integers');
+    }
+    if (dims % layers.length !== 0) throw new Error(`embedding dimensions ${dims} don't split evenly over ${layers.length} layers`);
+    if (pooling !== 'mean') throw new Error("embedding layers need pooling 'mean'");
+    if (typeof layerNormalize !== 'boolean') throw new Error('embedding layers need layer_normalize (true or false)');
+  } else if (pooling !== undefined || layerNormalize !== undefined) throw new Error('embedding pooling and layer_normalize apply only with layers');
+  if (maxChars !== undefined && !(Number.isInteger(maxChars) && maxChars > 0)) throw new Error('embedding max_chars must be a positive integer');
   if (a.reference !== undefined) validateReference(a.reference, dims);
   for (const [name, spec] of Object.entries(a.heads) as Array<[string, HeadSpec | undefined]>) {
     if (options.heads && !(options.heads as readonly string[]).includes(name)) throw new Error(`unknown head ${name}`);

@@ -46,7 +46,27 @@ export interface EmbeddingSpec {
     normalize: boolean;
     /** Provider-specific input type, e.g. Cohere's "classification" - part of what the vectors mean. */
     input_type?: string;
+    /**
+     * Multi-layer features: the model's transformer layers (1-based, in concatenation order) whose token
+     * states are pooled and concatenated, e.g. [4, 8, 12]. Absent: the model's standard sentence
+     * embedding. `dimensions` is then the layers' total width.
+     */
+    layers?: number[];
+    /** With `layers`: how each layer's token states are pooled ('mean' over the attention mask). */
+    pooling?: 'mean';
+    /** With `layers`: whether each pooled layer is unit-normalised before concatenation. */
+    layer_normalize?: boolean;
+    /** The numeric precision of the model that produced the vectors, e.g. 'fp32' or 'q8': quantisation changes them. */
+    precision?: string;
+    /** Characters kept per text before tokenising (`truncateText`); use the same value at runtime. */
+    max_chars?: number;
 }
+/**
+ * How a runtime's embedder differs from the one the artifact's heads were trained on (empty when they
+ * match). Vectors of the right width can still mean something else - another layer set, precision or
+ * input type - and heads scored on them carry no guarantee, so refuse to serve while this is non-empty.
+ */
+export declare function checkEmbeddingSpec(artifact: Pick<ClassifierArtifact, 'embedding'>, runtime: EmbeddingSpec): string[];
 export interface GateResult {
     passed: boolean;
     failures: string[];

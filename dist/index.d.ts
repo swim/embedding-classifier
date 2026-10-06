@@ -1,4 +1,4 @@
-export { calibrate, checkRuleSetPairing, headProbability, scoreEmbedding, validateArtifact } from './artifact.ts';
+export { calibrate, checkEmbeddingSpec, checkRuleSetPairing, headProbability, scoreEmbedding, validateArtifact } from './artifact.ts';
 export type { Calibration, ClassifierArtifact, EmbeddingSpec, GateResult, HeadSpec, Scores } from './artifact.ts';
 export { decide, missingPolicyHeads, settleWithRules } from './decide.ts';
 export type { Decision, DecisionPolicy, DecisionReason, RulesEvaluation, Settlement } from './decide.ts';

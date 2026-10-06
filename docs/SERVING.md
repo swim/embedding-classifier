@@ -70,4 +70,6 @@ clustered labels and very little for diffuse ones. Measure it on your own traffi
 | A long-running service | Anywhere | No cold starts. The same code as a function, loaded once |
 
 Whichever you choose, `artifact.embedding` records the model, dimensions, normalisation and input
-type the heads were trained on. Serving with anything else invalidates the guarantees.
+type the heads were trained on, and for multi-layer features the layers, pooling and precision.
+Serving with anything else invalidates the guarantees: check it at start-up with
+`checkEmbeddingSpec(artifact, runtimeSpec)` and refuse to serve on any difference.

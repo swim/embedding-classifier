@@ -9,6 +9,18 @@
 import { decisionFunction, predictIsotonic, sigmoid } from '@liquidau/solvers';
 import { THRESHOLD_MODES } from "./conformal.js";
 import { headFeatureVector, runtimeReference, similarities } from "./heads.js";
+/**
+ * How a runtime's embedder differs from the one the artifact's heads were trained on (empty when they
+ * match). Vectors of the right width can still mean something else - another layer set, precision or
+ * input type - and heads scored on them carry no guarantee, so refuse to serve while this is non-empty.
+ */
+export function checkEmbeddingSpec(artifact, runtime) {
+    const a = artifact.embedding;
+    const fields = ['model_id', 'dimensions', 'normalize', 'input_type', 'layers', 'pooling', 'layer_normalize', 'precision', 'max_chars'];
+    return fields
+        .filter((f) => JSON.stringify(a[f] ?? null) !== JSON.stringify(runtime[f] ?? null))
+        .map((f) => `embedding ${f}: the artifact was trained with ${JSON.stringify(a[f] ?? null)}, the runtime gives ${JSON.stringify(runtime[f] ?? null)}`);
+}
 export function calibrate(calibration, logit) {
     return calibration.method === 'platt'
         ? sigmoid(calibration.a * logit + calibration.c)
@@ -47,6 +59,22 @@ export function validateArtifact(raw, options = {}) {
     const dims = a.embedding.dimensions;
     if (!Number.isInteger(dims) || dims < 1)
         throw new Error(`embedding dimensions must be a positive integer, got ${dims}`);
+    const { layers, pooling, layer_normalize: layerNormalize, max_chars: maxChars } = a.embedding;
+    if (layers !== undefined) {
+        if (!Array.isArray(layers) || !layers.length || !layers.every((l) => Number.isInteger(l) && l >= 1) || new Set(layers).size !== layers.length) {
+            throw new Error('embedding layers must be distinct positive integers');
+        }
+        if (dims % layers.length !== 0)
+            throw new Error(`embedding dimensions ${dims} don't split evenly over ${layers.length} layers`);
+        if (pooling !== 'mean')
+            throw new Error("embedding layers need pooling 'mean'");
+        if (typeof layerNormalize !== 'boolean')
+            throw new Error('embedding layers need layer_normalize (true or false)');
+    }
+    else if (pooling !== undefined || layerNormalize !== undefined)
+        throw new Error('embedding pooling and layer_normalize apply only with layers');
+    if (maxChars !== undefined && !(Number.isInteger(maxChars) && maxChars > 0))
+        throw new Error('embedding max_chars must be a positive integer');
     if (a.reference !== undefined)
         validateReference(a.reference, dims);
     for (const [name, spec] of Object.entries(a.heads)) {

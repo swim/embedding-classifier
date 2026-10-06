@@ -119,3 +119,17 @@ test('validateArtifact refuses isotonic tables that are not probabilities; decid
   validateArtifact(head([0, 0.5, 1], [0, 0.3, 0.9]));
   assert.throws(() => decide(head([0, 1], [0, 1]), { h: 2.7 }, { priority: ['h'] }), /outside \[0, 1\]/);
 });
+
+test('EmbeddingSpec: multi-layer fields are validated, and checkEmbeddingSpec catches same-width embedders that mean something else', async () => {
+  const { validateArtifact, checkEmbeddingSpec } = await import('../src/index.ts');
+  const spec = { model_id: 'all-mpnet-base-v2', dimensions: 6, normalize: true, layers: [4, 8, 12], pooling: 'mean' as const, layer_normalize: true, precision: 'fp32', max_chars: 2000 };
+  const art = (embedding: Record<string, unknown>) => ({ version: 'v', created_at: '', embedding, heads: { h: { weights: [1, 0, 0, 0, 0, 0], bias: 0, calibration: { method: 'platt' as const, a: 1, c: 0 }, threshold: 0.5, review_floor: 0.25 } } });
+  validateArtifact(art(spec));
+  assert.throws(() => validateArtifact(art({ ...spec, layers: [4, 4, 12] })), /distinct positive integers/);
+  assert.throws(() => validateArtifact(art({ ...spec, layers: [4, 8, 12, 9] })), /split evenly/);
+  assert.throws(() => validateArtifact(art({ ...spec, pooling: undefined })), /pooling 'mean'/);
+  assert.throws(() => validateArtifact(art({ model_id: 'm', dimensions: 6, normalize: true, pooling: 'mean' })), /only with layers/);
+  assert.deepEqual(checkEmbeddingSpec({ embedding: spec }, spec), []);
+  const runtime = { ...spec, layers: [10, 11, 12], precision: 'q8' };
+  assert.deepEqual(checkEmbeddingSpec({ embedding: spec }, runtime).map((m) => m.split(':')[0]), ['embedding layers', 'embedding precision']);
+});

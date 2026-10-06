@@ -43,11 +43,12 @@ export interface HeadInput<H extends string> {
   /** Whether an existing mechanism already catches each example (see evaluateHead). */
   baseline?: readonly boolean[];
   /**
-   * The head's type (default 'linear': today's head). 'knn' and 'stack' score against the artifact's
-   * shared reference of training embeddings (see heads.ts; store result.reference as
-   * artifact.reference); 'auto' picks the type with the lowest cross-validated guarantee cost on the
-   * training rows (recorded in result.headChoice). Calibration, thresholds and guarantees are the same
-   * for every type. Non-linear types need X to be the embeddings, and don't take weak positives.
+   * The head's type (default 'auto'): 'auto' picks linear, knn or stack by cross-validated guarantee
+   * cost on the training rows (recorded in result.headChoice; see autoMargin). 'knn' and 'stack' score
+   * against the artifact's shared reference of training embeddings (heads.ts; buildArtifact stores it),
+   * so such an artifact holds training data. Calibration, thresholds and guarantees are the same for
+   * every type. Use 'linear' when X isn't an embedding (e.g. stacked scores) or the artifact must not
+   * hold training embeddings. Weak positives are linear-only: with them, 'auto' stays linear.
    */
   type?: HeadType | 'auto';
   /**
@@ -288,11 +289,13 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
 
   // The shared reference for knn, stack and auto heads: training rows labelled for any of them.
   // Generated records (synthetic text) are left out; retrieved ones are human-labelled and stay.
-  const nonLinear = input.heads.filter((h) => (h.type ?? 'linear') !== 'linear');
+  // 'auto' heads with weak positives stay linear (weak labels are linear-only).
+  const nonLinear = input.heads.filter((h) => (h.type ?? 'auto') !== 'linear' && !((h.type ?? 'auto') === 'auto' && h.weak?.X.length));
   let reference: { set: ReferenceSet; rows: Float32Array[]; index: number[] } | null = null;
   if (nonLinear.length) {
     for (const h of nonLinear) {
-      if (!(h.type === 'auto' || HEAD_TYPES.includes(h.type as HeadType))) throw new Error(`${h.name}: unknown head type ${h.type}`);
+      const t = h.type ?? 'auto';
+      if (!(t === 'auto' || HEAD_TYPES.includes(t as HeadType))) throw new Error(`${h.name}: unknown head type ${t}`);
       checkLength(`${h.name}: y`, h.y, X.length);
     }
     const generated = new Set(records ? records.flatMap((r, i) => (r.source.kind === 'generated' ? [i] : [])) : []);
@@ -303,7 +306,9 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
     reference = { set, rows: decodeReference(set), index };
   }
 
-  for (const { name, y: yIn, policy, prevalence, baseline, weak, maxWeakShare = 0.5, type = 'linear', dismissal } of input.heads) {
+  for (const { name, y: yIn, policy, prevalence, baseline, weak, maxWeakShare = 0.5, type: typeIn = 'auto', dismissal } of input.heads) {
+    const type = typeIn === 'auto' && weak?.X.length ? 'linear' : typeIn;
+    if (type !== typeIn) result.warnings.push(`${name}: weak positives are linear-only, so type 'auto' kept the linear head`);
     checkLength(`${name}: y`, yIn, X.length);
     checkLength(`${name}: dismissal.rows`, dismissal?.rows, X.length);
     if (dismissal?.background && background) checkLength(`${name}: dismissal.background`, dismissal.background, background.X.length);

@@ -140,10 +140,17 @@ test('validateArtifact checks feature widths and the reference', () => {
 
 test('linear heads are untouched: no reference, no features; weak positives stay linear-only', () => {
   const { X, y, split, groups } = world('diffuse', 400);
-  const result = trainHeads<'h'>({ X, split, groups, heads: [{ name: 'h', y, prevalence: 0.2, policy }] });
+  const result = trainHeads<'h'>({ X, split, groups, heads: [{ name: 'h', y, prevalence: 0.2, policy, type: 'linear' }] });
   assert.equal(result.reference, undefined);
   assert.equal(result.heads.h!.features, undefined);
   assert.deepEqual(result.headChoice, {});
   assert.throws(() => trainHeads<'h'>({ X, split, groups, heads: [{ name: 'h', y, prevalence: 0.2, policy, type: 'knn', weak: { X: [X[0]], weights: [1] } }] }), /linear heads only/);
+  // The default is 'auto'; with weak positives it keeps the linear head and says so.
+  const weakX = [X.find((_, i) => split[i] === 'train' && y[i] === 1)!.map((v) => v * 0.99)];
+  const auto = trainHeads<'h'>({ X, split, groups, heads: [{ name: 'h', y, prevalence: 0.2, policy, weak: { X: weakX, weights: [1] } }] });
+  assert.equal(auto.heads.h!.features, undefined);
+  assert.ok(auto.warnings.some((w) => /weak positives are linear-only/.test(w)));
+  const byDefault = trainHeads<'h'>({ X, split, groups, heads: [{ name: 'h', y, prevalence: 0.2, policy }] });
+  assert.ok(byDefault.headChoice.h, 'type defaults to auto');
   assert.throws(() => trainHeads<'h'>({ X, split, groups, heads: [{ name: 'h', y, prevalence: 0.2, policy, type: 'tree' as never }] }), /unknown head type/);
 });

@@ -32,7 +32,8 @@ A `knn` or `stack` head scores against `artifact.reference`: the training rows' 
 (float32) and their labels. Embeddings can be partly inverted back to text, so such an artifact is
 **data derived from training messages**, not just model weights: store, share and delete it as you
 would the messages. Generated records (synthetic text) are left out of the reference; retrieved
-records are human-labelled and stay. A linear head's artifact holds no training rows.
+records are human-labelled and stay. A linear head's artifact holds no training rows. With the default type `auto`, any head may become knn or stack:
+set `type: 'linear'` on heads whose artifact must not contain training embeddings.
 
 ## Coverage
 

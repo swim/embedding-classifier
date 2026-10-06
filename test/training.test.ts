@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import { CachedEmbedder, hashEmbedding, truncateText } from '../src/embedder.ts';
 import {
   assertRoundTrip,
+  buildArtifact,
   evaluateHead,
   gateHead,
   pickThreshold,
@@ -120,7 +121,8 @@ test('trainHeads end to end: fits, gates, and the serialised artifact scores ide
     ],
     slices: { third: X.map((_, i) => String(i % 3)) },
   });
-  assert.equal(lines.length, 2);
+  assert.equal(lines.filter((l) => /positive/.test(l)).length, 2, 'one split summary per head');
+  assert.equal(lines.filter((l) => /auto chose/.test(l)).length, 2, "type 'auto' (the default) reports its choice per head");
   const ev = result.evaluation.urgent!;
   assert.ok(ev.recall >= 0.9, `recall ${ev.recall}`);
   assert.ok(ev.false_alarm_rate < 0.1, `false alarms ${ev.false_alarm_rate}`);
@@ -128,10 +130,8 @@ test('trainHeads end to end: fits, gates, and the serialised artifact scores ide
   assert.deepEqual(result.failures, [], result.failures.join('; '));
   assert.equal(result.heads.urgent!.review_floor, result.heads.urgent!.threshold * 0.5);
 
-  const artifact: ClassifierArtifact<'urgent' | 'spam'> = {
-    version: 'v1', created_at: '', embedding: { model_id: 'test', dimensions: 8, normalize: false },
-    heads: result.heads, evaluation: result.evaluation, gates: { passed: true, failures: [], warnings: [] },
-  };
+  // buildArtifact carries whatever the heads need (a knn or stack head's reference) and the gates.
+  const artifact: ClassifierArtifact<'urgent' | 'spam'> = buildArtifact(result, { version: 'v1', createdAt: '', embedding: { model_id: 'test', dimensions: 8, normalize: false } });
   assertRoundTrip(artifact, X, result.testProbabilities);
   assert.throws(() => assertRoundTrip({ ...artifact, heads: { ...artifact.heads, urgent: { ...artifact.heads.urgent!, bias: 1 } } }, X, result.testProbabilities), /differs/);
   const report = reportMarkdown(artifact, { title: 'Test model', baselineName: 'rules' });

@@ -21,11 +21,12 @@ export interface HeadInput<H extends string> {
     /** Whether an existing mechanism already catches each example (see evaluateHead). */
     baseline?: readonly boolean[];
     /**
-     * The head's type (default 'linear': today's head). 'knn' and 'stack' score against the artifact's
-     * shared reference of training embeddings (see heads.ts; store result.reference as
-     * artifact.reference); 'auto' picks the type with the lowest cross-validated guarantee cost on the
-     * training rows (recorded in result.headChoice). Calibration, thresholds and guarantees are the same
-     * for every type. Non-linear types need X to be the embeddings, and don't take weak positives.
+     * The head's type (default 'auto'): 'auto' picks linear, knn or stack by cross-validated guarantee
+     * cost on the training rows (recorded in result.headChoice; see autoMargin). 'knn' and 'stack' score
+     * against the artifact's shared reference of training embeddings (heads.ts; buildArtifact stores it),
+     * so such an artifact holds training data. Calibration, thresholds and guarantees are the same for
+     * every type. Use 'linear' when X isn't an embedding (e.g. stacked scores) or the artifact must not
+     * hold training embeddings. Weak positives are linear-only: with them, 'auto' stays linear.
      */
     type?: HeadType | 'auto';
     /**

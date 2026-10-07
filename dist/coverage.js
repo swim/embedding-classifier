@@ -9,8 +9,8 @@
  * that describes the label (e.g. a subtype) as observable is the caller's error to avoid.
  */
 import { kishEffectiveN, minimumSamples } from '@liquidau/solvers';
-import { designOf } from "./design.js";
-import { isReal } from "./records.js";
+import { designOf } from './design.ts';
+import { isReal } from './records.ts';
 export function defineAxes(axes) {
     for (const [name, a] of Object.entries(axes)) {
         if (!a.values.length)

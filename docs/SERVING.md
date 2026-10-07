@@ -73,3 +73,14 @@ Whichever you choose, `artifact.embedding` records the model, dimensions, normal
 type the heads were trained on, and for multi-layer features the layers, pooling and precision.
 Serving with anything else invalidates the guarantees: check it at start-up with
 `checkEmbeddingSpec(artifact, runtimeSpec)` and refuse to serve on any difference.
+
+## Serving through @liquidau/router
+
+For a complete, validated serving path use `@liquidau/router`: it loads an immutable release
+(this artifact, the rule set, a routing policy and evaluation evidence, pinned by a manifest digest),
+checks every pairing and gate once, wraps `decide` and `settleWithRules`, and returns enforce or
+shadow decisions without Node built-ins. Build artifacts for it with
+`buildArtifact(result, { ..., router: { ruleSetHash: ruleSetHash(ruleSet) } })`, and record
+`embedding.precision`: the router refuses artifacts that don't state it. With `layers`, the router
+reads `layer_normalize: true` as per-layer unit normalisation; `normalize` does not describe a
+concatenation of layers (it is not unit length).

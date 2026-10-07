@@ -7,13 +7,17 @@
  *                     evaluated on real data.
  *
  * Serving modes: `shadow` scores and records but never acts; `enforce` acts on decisions.
+ *
+ * Deprecated: complete releases (classifier, rules, policy and evidence, loaded and validated
+ * together) belong to @liquidau/router's loadRouter and its release manifest. These stay supported
+ * until an announced breaking release.
  */
 import type { ClassifierArtifact } from './artifact.ts';
 
 export type ServeMode = 'shadow' | 'enforce';
 export type ArtifactRole = 'promoted' | 'shadow-candidate';
 
-/** Locations to try, in order: shadow mode prefers a shadow candidate; enforce only loads the promoted artifact. */
+/** @deprecated Load a complete release with @liquidau/router's loadRouter. Locations to try, in order: shadow mode prefers a shadow candidate; enforce only loads the promoted artifact. */
 export function loadOrder<K>(mode: ServeMode, locations: { promoted: K; shadowCandidate?: K | null }): Array<{ location: K; role: ArtifactRole }> {
   return [
     ...(mode === 'shadow' && locations.shadowCandidate != null ? [{ location: locations.shadowCandidate, role: 'shadow-candidate' as const }] : []),
@@ -22,6 +26,7 @@ export function loadOrder<K>(mode: ServeMode, locations: { promoted: K; shadowCa
 }
 
 /**
+ * @deprecated @liquidau/router's loadRouter checks classifier and complete-release gates together.
  * Why `artifact` must not be served in `mode`, or null if it may. Enforcement requires recorded,
  * passed gates - checked at load time too, so an artifact copied into place by hand still can't act.
  */
@@ -31,6 +36,7 @@ export function refuseToServe(mode: ServeMode, artifact: Pick<ClassifierArtifact
 }
 
 /**
+ * @deprecated Publish complete releases with @liquidau/router's buildRelease.
  * What publishing may do with a freshly trained artifact. Returns the role to point at it (null:
  * upload the versioned artifact only), or an error.
  *   blockedReason      set when the artifact must never be published (e.g. trained on fake embeddings)

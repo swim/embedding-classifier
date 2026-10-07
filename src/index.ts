@@ -1,7 +1,7 @@
-export { calibrate, checkEmbeddingSpec, checkRuleSetPairing, headProbability, scoreEmbedding, validateArtifact } from './artifact.ts';
-export type { Calibration, ClassifierArtifact, EmbeddingSpec, GateResult, HeadSpec, Scores } from './artifact.ts';
+export { calibrate, checkEmbeddingSpec, checkRuleSetPairing, headProbability, prepareScoring, routerRuleSetHash, scoreEmbedding, validateArtifact } from './artifact.ts';
+export type { Calibration, ClassifierArtifact, EmbeddingSpec, GateResult, HeadSpec, RouterTraining, Scores } from './artifact.ts';
 export { decide, missingPolicyHeads, settleWithRules } from './decide.ts';
-export type { Decision, DecisionPolicy, DecisionReason, RulesEvaluation, Settlement } from './decide.ts';
+export type { Decision, DecisionHeads, DecisionPolicy, DecisionReason, RulesEvaluation, Settlement } from './decide.ts';
 export { budgetThreshold, falseAlarmCap, nextUp, pickThreshold } from './threshold.ts';
 export type { HeadPolicy } from './threshold.ts';
 export { evaluateHead } from './evaluate.ts';
@@ -28,3 +28,12 @@ export { truncateText } from './text.ts';
 export { HEAD_TYPES } from './heads.ts';
 export type { HeadFeatures, HeadType, ReferenceSet } from './heads.ts';
 export type { DriftCheck } from './monitor.ts';
+export {
+  buildDocumentArtifact, chunkVectorProblems, documentCompatibilityProblems, documentFeatureEmbedding, documentFeatureIdentity, DOCUMENT_ARTIFACT_SCHEMA, DOCUMENT_ERROR_CODES,
+  DOCUMENT_FEATURES_SCHEMA, DocumentError, FULL_ENCODER_IDENTITY_SCHEMA, fullEncoderIdentityProblems, isDocumentArtifact, poolChunkVectors, prepareDocumentFeatures,
+  scoreDocument, scoreDocumentEmbeddings, trainDocumentHeads, validateDocumentArtifact,
+} from './document.ts';
+export type {
+  DocumentAdapters, DocumentClassifierArtifact, DocumentEncoder, DocumentErrorCode, EncoderUsage, DocumentFeatureRecord, DocumentFeatures, DocumentHeadInput, DocumentOptions,
+  DocumentScoreResult, DocumentTrainInput, DocumentTrainResult, FullEncoderIdentity,
+} from './document.ts';

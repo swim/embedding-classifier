@@ -4,7 +4,15 @@
  * review band. That is how "never send a possibly urgent message a dismissive 'out of scope' reply"
  * is expressed: suppress the scope heads whenever any priority head is at or above its review floor.
  */
-import type { ClassifierArtifact, Scores } from './artifact.ts';
+import type { HeadSpec, Scores } from './artifact.ts';
+
+/**
+ * What decide() reads from an artifact: each head's threshold and review floor. A ClassifierArtifact
+ * is one; so is a restricted projection such as @liquidau/router's offline decision model.
+ */
+export interface DecisionHeads<H extends string = string> {
+  heads: Partial<Record<H, Pick<HeadSpec, 'threshold' | 'review_floor'>>>;
+}
 
 /** 'rule': a certified firing rule decided the head (settleWithRules, or `fired` in decide). */
 export type DecisionReason = 'above_threshold' | 'near_threshold' | 'none' | 'rule';
@@ -27,7 +35,7 @@ export interface DecisionPolicy<H extends string = string> {
  * suppression rule whose guard head is absent guards nothing. Call this once at startup and refuse
  * to serve, or log, if the result isn't what you expect.
  */
-export function missingPolicyHeads<H extends string>(artifact: ClassifierArtifact<H>, policy: DecisionPolicy<H>): H[] {
+export function missingPolicyHeads<H extends string>(artifact: DecisionHeads<H>, policy: DecisionPolicy<H>): H[] {
   const named = new Set<H>([...policy.priority, ...(policy.suppress ?? []).flatMap((r) => [...r.when, ...r.heads])]);
   return [...named].filter((h) => artifact.heads[h] === undefined);
 }
@@ -37,7 +45,7 @@ export function missingPolicyHeads<H extends string>(artifact: ClassifierArtifac
  * is a scoring bug or a corrupted artifact, not a negative. `dismissed`: heads a certified dismissal rule cleared for this message (rule-miner's
  * matcher.evaluate); they need no score, never fire and never suppress, as their training counted.
  */
-export function decide<H extends string>(artifact: ClassifierArtifact<H>, scores: Scores<H>, policy: DecisionPolicy<H>, dismissed: readonly H[] = [], fired: H | null = null): Decision<H> {
+export function decide<H extends string>(artifact: DecisionHeads<H>, scores: Scores<H>, policy: DecisionPolicy<H>, dismissed: readonly H[] = [], fired: H | null = null): Decision<H> {
   // `fired`: a certified firing rule matched this head ("rules or classifier"): it counts as at its threshold.
   const atLeast = (head: H, level: 'threshold' | 'review_floor') => {
     if (head === fired && !dismissed.includes(head)) return true;

@@ -4,7 +4,14 @@
  * review band. That is how "never send a possibly urgent message a dismissive 'out of scope' reply"
  * is expressed: suppress the scope heads whenever any priority head is at or above its review floor.
  */
-import type { ClassifierArtifact, Scores } from './artifact.ts';
+import type { HeadSpec, Scores } from './artifact.ts';
+/**
+ * What decide() reads from an artifact: each head's threshold and review floor. A ClassifierArtifact
+ * is one; so is a restricted projection such as @liquidau/router's offline decision model.
+ */
+export interface DecisionHeads<H extends string = string> {
+    heads: Partial<Record<H, Pick<HeadSpec, 'threshold' | 'review_floor'>>>;
+}
 /** 'rule': a certified firing rule decided the head (settleWithRules, or `fired` in decide). */
 export type DecisionReason = 'above_threshold' | 'near_threshold' | 'none' | 'rule';
 export interface Decision<H extends string = string> {
@@ -26,13 +33,13 @@ export interface DecisionPolicy<H extends string = string> {
  * suppression rule whose guard head is absent guards nothing. Call this once at startup and refuse
  * to serve, or log, if the result isn't what you expect.
  */
-export declare function missingPolicyHeads<H extends string>(artifact: ClassifierArtifact<H>, policy: DecisionPolicy<H>): H[];
+export declare function missingPolicyHeads<H extends string>(artifact: DecisionHeads<H>, policy: DecisionPolicy<H>): H[];
 /**
  * Throws if a head the artifact contains has a missing or non-finite score, or one outside [0, 1]: that
  * is a scoring bug or a corrupted artifact, not a negative. `dismissed`: heads a certified dismissal rule cleared for this message (rule-miner's
  * matcher.evaluate); they need no score, never fire and never suppress, as their training counted.
  */
-export declare function decide<H extends string>(artifact: ClassifierArtifact<H>, scores: Scores<H>, policy: DecisionPolicy<H>, dismissed?: readonly H[], fired?: H | null): Decision<H>;
+export declare function decide<H extends string>(artifact: DecisionHeads<H>, scores: Scores<H>, policy: DecisionPolicy<H>, dismissed?: readonly H[], fired?: H | null): Decision<H>;
 /** What a rule set says about one message: rule-miner's `ruleSetMatcher(set).evaluate(text)`. */
 export interface RulesEvaluation {
     fired: {

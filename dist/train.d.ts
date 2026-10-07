@@ -1,6 +1,6 @@
 import { type DesignSummary } from './design.ts';
 import { type ExampleRecord, type ProvenanceCode, type ProvenanceOptions, type WeightCaps, type WeightCapSummary } from './records.ts';
-import { type ClassifierArtifact, type EmbeddingSpec, type HeadSpec } from './artifact.ts';
+import { type ClassifierArtifact, type EmbeddingSpec, type HeadSpec, type RouterTraining } from './artifact.ts';
 import { type HeadEvaluation } from './evaluate.ts';
 import { type HeadType, type ReferenceSet } from './heads.ts';
 import { type HeadPolicy } from './threshold.ts';
@@ -240,4 +240,6 @@ export declare function buildArtifact<H extends string>(result: TrainResult<H>, 
     embedding: EmbeddingSpec;
     createdAt?: string;
     training?: Record<string, unknown>;
+    /** For @liquidau/router: the rule set the artifact was trained and evaluated with, stored as `training.router`. */
+    router?: RouterTraining;
 }): ClassifierArtifact<H>;

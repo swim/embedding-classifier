@@ -54,7 +54,10 @@ export interface EmbeddingSpec {
     layers?: number[];
     /** With `layers`: how each layer's token states are pooled ('mean' over the attention mask). */
     pooling?: 'mean';
-    /** With `layers`: whether each pooled layer is unit-normalised before concatenation. */
+    /**
+     * With `layers`: whether each pooled layer is unit-normalised before concatenation. The concatenation
+     * is then not unit length, whatever `normalize` says (@liquidau/router maps it to 'per-layer-unit').
+     */
     layer_normalize?: boolean;
     /** The numeric precision of the model that produced the vectors, e.g. 'fp32' or 'q8': quantisation changes them. */
     precision?: string;
@@ -67,6 +70,21 @@ export interface EmbeddingSpec {
  * input type - and heads scored on them carry no guarantee, so refuse to serve while this is non-empty.
  */
 export declare function checkEmbeddingSpec(artifact: Pick<ClassifierArtifact, 'embedding'>, runtime: EmbeddingSpec): string[];
+/**
+ * The router integration record, stored as `training.router` (buildArtifact's `router` option): the
+ * semantic hash (rule-miner's ruleSetHash) of the complete rule set this artifact was trained and
+ * evaluated with, firing and dismissal rules alike. @liquidau/router refuses a release whose rules
+ * tier runs another rule set. An artifact without it predates the router and needs a legacy conversion.
+ */
+export interface RouterTraining {
+    ruleSetHash: string;
+}
+/**
+ * The artifact's `training.router.ruleSetHash`, or undefined when it has no router record. Throws if
+ * the record is present but malformed: the hash must be lowercase hex SHA-256, nothing is guessed from
+ * other metadata.
+ */
+export declare function routerRuleSetHash(artifact: Pick<ClassifierArtifact, 'training'>): string | undefined;
 export interface GateResult {
     passed: boolean;
     failures: string[];
@@ -98,6 +116,12 @@ export declare function validateArtifact<H extends string = string>(raw: unknown
     heads?: readonly H[];
     mode?: 'shadow' | 'enforce';
 }): ClassifierArtifact<H>;
+/**
+ * Builds the artifact's runtime scoring state now (decoded reference rows, stack heads' projected
+ * rows) instead of on the first scoreEmbedding call, so a server pays it once at start-up. The state
+ * is cached against the artifact's reference object: don't mutate a prepared artifact.
+ */
+export declare function prepareScoring<H extends string>(artifact: ClassifierArtifact<H>): void;
 /** Calibrated probability for every head in the artifact. */
 export declare function scoreEmbedding<H extends string>(artifact: ClassifierArtifact<H>, embedding: ArrayLike<number>): Scores<H>;
 /**

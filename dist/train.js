@@ -527,6 +527,11 @@ export function assertRoundTrip(artifact, X, testProbabilities, sample = 50) {
  */
 export function buildArtifact(result, options) {
     const training = { ...(options.training ?? {}) };
+    if (options.router) {
+        if (!/^[0-9a-f]{64}$/.test(options.router.ruleSetHash))
+            throw new Error('router.ruleSetHash must be a lowercase hex SHA-256 (rule-miner ruleSetHash)');
+        training.router = { ruleSetHash: options.router.ruleSetHash };
+    }
     if (Object.keys(result.headChoice).length)
         training.head_choice = result.headChoice;
     if (Object.keys(result.convergence).length)

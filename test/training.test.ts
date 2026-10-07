@@ -14,6 +14,7 @@ import {
   publishPlan,
   reportMarkdown,
   trainHeads,
+  validateArtifact,
   type ClassifierArtifact,
   type HeadPolicy,
   type Split,
@@ -134,6 +135,10 @@ test('trainHeads end to end: fits, gates, and the serialised artifact scores ide
   const artifact: ClassifierArtifact<'urgent' | 'spam'> = buildArtifact(result, { version: 'v1', createdAt: '', embedding: { model_id: 'test', dimensions: 8, normalize: false } });
   assertRoundTrip(artifact, X, result.testProbabilities);
   assert.throws(() => assertRoundTrip({ ...artifact, heads: { ...artifact.heads, urgent: { ...artifact.heads.urgent!, bias: 1 } } }, X, result.testProbabilities), /differs/);
+  // The router pairing record: stored under training.router, validated, malformed hashes refused.
+  const paired = buildArtifact(result, { version: 'v1', createdAt: '', embedding: artifact.embedding, router: { ruleSetHash: 'f'.repeat(64) } });
+  assert.deepEqual(validateArtifact(JSON.parse(JSON.stringify(paired))).training?.router, { ruleSetHash: 'f'.repeat(64) });
+  assert.throws(() => buildArtifact(result, { version: 'v1', embedding: artifact.embedding, router: { ruleSetHash: 'nope' } }), /ruleSetHash/);
   const report = reportMarkdown(artifact, { title: 'Test model', baselineName: 'rules' });
   assert.match(report, /^# Test model/);
   assert.match(report, /## urgent/);

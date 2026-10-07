@@ -8,7 +8,7 @@
  */
 import { decisionFunction, predictIsotonic, sigmoid } from '@liquidau/solvers';
 import { THRESHOLD_MODES } from "./conformal.js";
-import { headFeatureVector, runtimeReference, similarities } from "./heads.js";
+import { decodeReference, headFeatureVector, projectedRows, runtimeReference, similarities } from "./heads.js";
 /**
  * How a runtime's embedder differs from the one the artifact's heads were trained on (empty when they
  * match). Vectors of the right width can still mean something else - another layer set, precision or
@@ -20,6 +20,21 @@ export function checkEmbeddingSpec(artifact, runtime) {
     return fields
         .filter((f) => JSON.stringify(a[f] ?? null) !== JSON.stringify(runtime[f] ?? null))
         .map((f) => `embedding ${f}: the artifact was trained with ${JSON.stringify(a[f] ?? null)}, the runtime gives ${JSON.stringify(runtime[f] ?? null)}`);
+}
+/**
+ * The artifact's `training.router.ruleSetHash`, or undefined when it has no router record. Throws if
+ * the record is present but malformed: the hash must be lowercase hex SHA-256, nothing is guessed from
+ * other metadata.
+ */
+export function routerRuleSetHash(artifact) {
+    const record = artifact.training?.router;
+    if (record === undefined)
+        return undefined;
+    const hash = record?.ruleSetHash;
+    if (!record || typeof record !== 'object' || Array.isArray(record) || typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) {
+        throw new Error('artifact training.router must be { ruleSetHash: <lowercase hex SHA-256> }');
+    }
+    return hash;
 }
 export function calibrate(calibration, logit) {
     return calibration.method === 'platt'
@@ -77,6 +92,7 @@ export function validateArtifact(raw, options = {}) {
         throw new Error('embedding max_chars must be a positive integer');
     if (a.reference !== undefined)
         validateReference(a.reference, dims);
+    routerRuleSetHash(a);
     for (const [name, spec] of Object.entries(a.heads)) {
         if (options.heads && !options.heads.includes(name))
             throw new Error(`unknown head ${name}`);
@@ -150,6 +166,13 @@ function validateReference(ref, dims) {
         if (!Array.isArray(ys) || ys.length !== ref.rows || !ys.every((v) => v === 0 || v === 1 || v === null))
             throw new Error(`reference labels for ${head} must be 0, 1 or null, one per row`);
     }
+    // The encoded values themselves: a float32 row can hold NaN or Infinity, which would score NaN later.
+    const rows = decodeReference(ref);
+    for (let i = 0; i < rows.length; i++) {
+        for (let t = 0; t < rows[i].length; t++)
+            if (!Number.isFinite(rows[i][t]))
+                throw new Error(`reference row ${i} has a non-finite value at index ${t}`);
+    }
 }
 /** Checks a head's feature block and returns its width. */
 function validateFeatures(name, f, dims, ref) {
@@ -192,6 +215,20 @@ function validateGuarantee(name, g) {
     for (const k of ['false_alarm', 'background_rate']) {
         if (g[k] !== undefined && (g.kind === 'none' || !isRate(g[k])))
             throw new Error(`head ${name}: guarantee ${k} must be in (0, 1) and only with a guarantee`);
+    }
+}
+/**
+ * Builds the artifact's runtime scoring state now (decoded reference rows, stack heads' projected
+ * rows) instead of on the first scoreEmbedding call, so a server pays it once at start-up. The state
+ * is cached against the artifact's reference object: don't mutate a prepared artifact.
+ */
+export function prepareScoring(artifact) {
+    if (!artifact.reference)
+        return;
+    const ref = runtimeReference(artifact.reference);
+    for (const [head, spec] of Object.entries(artifact.heads)) {
+        if (spec?.features?.kind === 'stack')
+            projectedRows(head, spec.features, ref);
     }
 }
 /** Calibrated probability for every head in the artifact. */

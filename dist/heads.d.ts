@@ -64,6 +64,10 @@ interface RuntimeReference {
     projected: Map<string, number[][]>;
 }
 export declare function runtimeReference(ref: ReferenceSet): RuntimeReference;
+/** A stack head's reference rows on its principal components (computed once per head, then cached). */
+export declare function projectedRows(head: string, features: Extract<HeadFeatures, {
+    kind: 'stack';
+}>, ref: RuntimeReference): number[][];
 /** Features for one head at runtime; `sims` are the embedding's cosines to every reference row (computed once per message). */
 export declare function headFeatureVector(head: string, features: HeadFeatures, embedding: ArrayLike<number>, ref: RuntimeReference, sims: ArrayLike<number>): number[];
 /** Fold of a row (FNV-style hash of its key). */

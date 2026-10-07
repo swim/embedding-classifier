@@ -228,6 +228,15 @@ export function runtimeReference(ref) {
     }
     return r;
 }
+/** A stack head's reference rows on its principal components (computed once per head, then cached). */
+export function projectedRows(head, features, ref) {
+    let proj = ref.projected.get(head);
+    if (!proj) {
+        proj = ref.rows.map((row) => project(features.pca, row));
+        ref.projected.set(head, proj);
+    }
+    return proj;
+}
 /** Features for one head at runtime; `sims` are the embedding's cosines to every reference row (computed once per message). */
 export function headFeatureVector(head, features, embedding, ref, sims) {
     const pos = ref.pos.get(head), neg = ref.neg.get(head);
@@ -236,11 +245,7 @@ export function headFeatureVector(head, features, embedding, ref, sims) {
     const knn = knnFeature(sims, pos, neg, features.k);
     if (features.kind === 'knn')
         return [knn];
-    let proj = ref.projected.get(head);
-    if (!proj) {
-        proj = ref.rows.map((row) => project(features.pca, row));
-        ref.projected.set(head, proj);
-    }
+    const proj = projectedRows(head, features, ref);
     const z = project(features.pca, embedding);
     const simsPca = proj.map((v) => dot(z, v));
     return [decisionFunction({ coef: features.linear.weights, intercept: features.linear.bias }, embedding), knn, knnFeature(simsPca, pos, neg, features.k)];

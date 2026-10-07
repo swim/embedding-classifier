@@ -9,7 +9,7 @@
 import { decisionFunction, predictIsotonic, sigmoid } from '@liquidau/solvers';
 
 import { THRESHOLD_MODES, type Guarantee } from './conformal.ts';
-import { headFeatureVector, runtimeReference, similarities, type HeadFeatures, type ReferenceSet } from './heads.ts';
+import { decodeReference, headFeatureVector, projectedRows, runtimeReference, similarities, type HeadFeatures, type ReferenceSet } from './heads.ts';
 
 export type Calibration =
   | { method: 'platt'; a: number; c: number }
@@ -59,7 +59,10 @@ export interface EmbeddingSpec {
   layers?: number[];
   /** With `layers`: how each layer's token states are pooled ('mean' over the attention mask). */
   pooling?: 'mean';
-  /** With `layers`: whether each pooled layer is unit-normalised before concatenation. */
+  /**
+   * With `layers`: whether each pooled layer is unit-normalised before concatenation. The concatenation
+   * is then not unit length, whatever `normalize` says (@liquidau/router maps it to 'per-layer-unit').
+   */
   layer_normalize?: boolean;
   /** The numeric precision of the model that produced the vectors, e.g. 'fp32' or 'q8': quantisation changes them. */
   precision?: string;
@@ -78,6 +81,31 @@ export function checkEmbeddingSpec(artifact: Pick<ClassifierArtifact, 'embedding
   return fields
     .filter((f) => JSON.stringify(a[f] ?? null) !== JSON.stringify(runtime[f] ?? null))
     .map((f) => `embedding ${f}: the artifact was trained with ${JSON.stringify(a[f] ?? null)}, the runtime gives ${JSON.stringify(runtime[f] ?? null)}`);
+}
+
+/**
+ * The router integration record, stored as `training.router` (buildArtifact's `router` option): the
+ * semantic hash (rule-miner's ruleSetHash) of the complete rule set this artifact was trained and
+ * evaluated with, firing and dismissal rules alike. @liquidau/router refuses a release whose rules
+ * tier runs another rule set. An artifact without it predates the router and needs a legacy conversion.
+ */
+export interface RouterTraining {
+  ruleSetHash: string;
+}
+
+/**
+ * The artifact's `training.router.ruleSetHash`, or undefined when it has no router record. Throws if
+ * the record is present but malformed: the hash must be lowercase hex SHA-256, nothing is guessed from
+ * other metadata.
+ */
+export function routerRuleSetHash(artifact: Pick<ClassifierArtifact, 'training'>): string | undefined {
+  const record = artifact.training?.router;
+  if (record === undefined) return undefined;
+  const hash = (record as Partial<RouterTraining> | null)?.ruleSetHash;
+  if (!record || typeof record !== 'object' || Array.isArray(record) || typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) {
+    throw new Error('artifact training.router must be { ruleSetHash: <lowercase hex SHA-256> }');
+  }
+  return hash;
 }
 
 export interface GateResult {
@@ -147,6 +175,7 @@ export function validateArtifact<H extends string = string>(raw: unknown, option
   } else if (pooling !== undefined || layerNormalize !== undefined) throw new Error('embedding pooling and layer_normalize apply only with layers');
   if (maxChars !== undefined && !(Number.isInteger(maxChars) && maxChars > 0)) throw new Error('embedding max_chars must be a positive integer');
   if (a.reference !== undefined) validateReference(a.reference, dims);
+  routerRuleSetHash(a);
   for (const [name, spec] of Object.entries(a.heads) as Array<[string, HeadSpec | undefined]>) {
     if (options.heads && !(options.heads as readonly string[]).includes(name)) throw new Error(`unknown head ${name}`);
     const width = spec?.features ? validateFeatures(name, spec.features, dims, a.reference) : dims;
@@ -199,6 +228,11 @@ function validateReference(ref: ReferenceSet, dims: number): void {
   for (const [head, ys] of Object.entries(ref.labels)) {
     if (!Array.isArray(ys) || ys.length !== ref.rows || !ys.every((v) => v === 0 || v === 1 || v === null)) throw new Error(`reference labels for ${head} must be 0, 1 or null, one per row`);
   }
+  // The encoded values themselves: a float32 row can hold NaN or Infinity, which would score NaN later.
+  const rows = decodeReference(ref);
+  for (let i = 0; i < rows.length; i++) {
+    for (let t = 0; t < rows[i].length; t++) if (!Number.isFinite(rows[i][t])) throw new Error(`reference row ${i} has a non-finite value at index ${t}`);
+  }
 }
 
 /** Checks a head's feature block and returns its width. */
@@ -231,6 +265,19 @@ function validateGuarantee(name: string, g: Guarantee): void {
   if (!withDelta && g.delta !== undefined) throw new Error(`head ${name}: only pac and design guarantees have a delta`);
   for (const k of ['false_alarm', 'background_rate'] as const) {
     if (g[k] !== undefined && (g.kind === 'none' || !isRate(g[k]))) throw new Error(`head ${name}: guarantee ${k} must be in (0, 1) and only with a guarantee`);
+  }
+}
+
+/**
+ * Builds the artifact's runtime scoring state now (decoded reference rows, stack heads' projected
+ * rows) instead of on the first scoreEmbedding call, so a server pays it once at start-up. The state
+ * is cached against the artifact's reference object: don't mutate a prepared artifact.
+ */
+export function prepareScoring<H extends string>(artifact: ClassifierArtifact<H>): void {
+  if (!artifact.reference) return;
+  const ref = runtimeReference(artifact.reference);
+  for (const [head, spec] of Object.entries(artifact.heads) as Array<[H, HeadSpec | undefined]>) {
+    if (spec?.features?.kind === 'stack') projectedRows(head, spec.features, ref);
   }
 }
 

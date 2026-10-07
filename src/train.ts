@@ -19,7 +19,7 @@ import { clopperPearsonUpper, conformalLowerThreshold, conformalRank, decisionFu
 import { designOf, type DesignSummary } from './design.ts';
 import { capTrainingWeights, validateProvenance, type ExampleRecord, type ProvenanceCode, type ProvenanceOptions, type WeightCaps, type WeightCapSummary } from './records.ts';
 import { conformalThreshold, groupScores, type FalseAlarmConstraint, type Guarantee, type Sufficiency } from './conformal.ts';
-import { calibrate, scoreEmbedding, validateArtifact, type Calibration, type ClassifierArtifact, type EmbeddingSpec, type HeadSpec } from './artifact.ts';
+import { calibrate, scoreEmbedding, validateArtifact, type Calibration, type ClassifierArtifact, type EmbeddingSpec, type HeadSpec, type RouterTraining } from './artifact.ts';
 import { evaluateHead, type HeadEvaluation } from './evaluate.ts';
 import { gateHead } from './gates.ts';
 import { crossValidatedScores, decodeReference, encodeReference, fitFeatures, guaranteeCost, HEAD_TYPES, type FeatureTraining, type FittedFeatures, type HeadType, type ReferenceSet } from './heads.ts';
@@ -672,8 +672,22 @@ export function assertRoundTrip<H extends string>(
  * gate failed), so they are never set by hand. Also records the reference, head choices, convergence,
  * provenance, design and weak-label summaries. Serve it through validateArtifact(raw, { mode }).
  */
-export function buildArtifact<H extends string>(result: TrainResult<H>, options: { version: string; embedding: EmbeddingSpec; createdAt?: string; training?: Record<string, unknown> }): ClassifierArtifact<H> {
+export function buildArtifact<H extends string>(
+  result: TrainResult<H>,
+  options: {
+    version: string;
+    embedding: EmbeddingSpec;
+    createdAt?: string;
+    training?: Record<string, unknown>;
+    /** For @liquidau/router: the rule set the artifact was trained and evaluated with, stored as `training.router`. */
+    router?: RouterTraining;
+  },
+): ClassifierArtifact<H> {
   const training: Record<string, unknown> = { ...(options.training ?? {}) };
+  if (options.router) {
+    if (!/^[0-9a-f]{64}$/.test(options.router.ruleSetHash)) throw new Error('router.ruleSetHash must be a lowercase hex SHA-256 (rule-miner ruleSetHash)');
+    training.router = { ruleSetHash: options.router.ruleSetHash };
+  }
   if (Object.keys(result.headChoice).length) training.head_choice = result.headChoice;
   if (Object.keys(result.convergence).length) training.convergence = result.convergence;
   if (Object.keys(result.weakLabels).length) training.weak_labels = result.weakLabels;

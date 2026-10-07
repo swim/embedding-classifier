@@ -1,4 +1,4 @@
-/** Locations to try, in order: shadow mode prefers a shadow candidate; enforce only loads the promoted artifact. */
+/** @deprecated Load a complete release with @liquidau/router's loadRouter. Locations to try, in order: shadow mode prefers a shadow candidate; enforce only loads the promoted artifact. */
 export function loadOrder(mode, locations) {
     return [
         ...(mode === 'shadow' && locations.shadowCandidate != null ? [{ location: locations.shadowCandidate, role: 'shadow-candidate' }] : []),
@@ -6,6 +6,7 @@ export function loadOrder(mode, locations) {
     ];
 }
 /**
+ * @deprecated @liquidau/router's loadRouter checks classifier and complete-release gates together.
  * Why `artifact` must not be served in `mode`, or null if it may. Enforcement requires recorded,
  * passed gates - checked at load time too, so an artifact copied into place by hand still can't act.
  */
@@ -15,6 +16,7 @@ export function refuseToServe(mode, artifact) {
     return null;
 }
 /**
+ * @deprecated Publish complete releases with @liquidau/router's buildRelease.
  * What publishing may do with a freshly trained artifact. Returns the role to point at it (null:
  * upload the versioned artifact only), or an error.
  *   blockedReason      set when the artifact must never be published (e.g. trained on fake embeddings)

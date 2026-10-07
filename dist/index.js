@@ -1,4 +1,4 @@
-export { calibrate, checkEmbeddingSpec, checkRuleSetPairing, headProbability, scoreEmbedding, validateArtifact } from "./artifact.js";
+export { calibrate, checkEmbeddingSpec, checkRuleSetPairing, headProbability, prepareScoring, routerRuleSetHash, scoreEmbedding, validateArtifact } from "./artifact.js";
 export { decide, missingPolicyHeads, settleWithRules } from "./decide.js";
 export { budgetThreshold, falseAlarmCap, nextUp, pickThreshold } from "./threshold.js";
 export { evaluateHead } from "./evaluate.js";
@@ -15,3 +15,4 @@ export { checkSliceAxes, coverageReport, defineAxes } from "./coverage.js";
 export { monitorWindow } from "./monitor.js";
 export { truncateText } from "./text.js";
 export { HEAD_TYPES } from "./heads.js";
+export { buildDocumentArtifact, chunkVectorProblems, documentCompatibilityProblems, documentFeatureEmbedding, documentFeatureIdentity, DOCUMENT_ARTIFACT_SCHEMA, DOCUMENT_ERROR_CODES, DOCUMENT_FEATURES_SCHEMA, DocumentError, FULL_ENCODER_IDENTITY_SCHEMA, fullEncoderIdentityProblems, isDocumentArtifact, poolChunkVectors, prepareDocumentFeatures, scoreDocument, scoreDocumentEmbeddings, trainDocumentHeads, validateDocumentArtifact, } from "./document.js";

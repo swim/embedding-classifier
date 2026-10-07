@@ -4,26 +4,31 @@
  * hence its own entry point: `@liquidau/embedding-classifier/embedder`. For training; at serving
  * time call the model directly on `truncateText(text, maxChars)` from the package root.
  *
- * Cache, format 'json' (default): one JSON file mapping sha256(truncated text) -> vector. Use one file
- * per model + dimension. Saves are atomic (write a temporary file, then rename), so a process reading
- * the cache never sees a half-written file. Two processes WRITING the same cache can still drop each
- * other's newest entries (last save wins) - run them one after another. Each save rewrites the whole
- * file, so checkpoints slow down as the cache grows, and a cache past ~512 MB (about 150,000 vectors
- * at 768 dimensions) can't be saved at all: V8 can't build the string (FINDINGS O7).
+ * Several processes may share one cache: every save takes an exclusive lock file
+ * (`${cachePath}.lock`; a lock left by a crashed process is broken once its owner is gone or it is
+ * older than a minute), so writers never interleave. A process doesn't see entries another process
+ * adds after it loaded; it embeds those texts again and appends duplicates, which are harmless.
  *
- * Format 'binary': two append-only files, `${cachePath}.f32` (float32 rows) and `${cachePath}.keys`
- * (one key per line). A checkpoint appends only the new vectors, so it costs the same at any size, and
- * vectors stay float32 in memory. Requires `dimensions`. Vectors are written before their keys; on
- * load, anything after the last complete, matched entry (an interrupted append) is trimmed from both
- * files. Float32 is lossless for float32 models (local transformers.js models); providers that return
- * doubles lose about 1e-7 relative precision. One writer at a time, as with 'json'. Prefer it beyond
- * ~50,000 vectors.
+ * Format 'json' (default): one JSON file mapping sha256(truncated text) -> vector. Each save merges
+ * the file's current entries (another writer's) and replaces it atomically (a temporary file, then a
+ * rename). Each save rewrites the whole file, so checkpoints slow down as the cache grows, and a cache
+ * past ~512 MB (about 150,000 vectors at 768 dimensions) can't be saved at all: V8 can't build the
+ * string. Use 'binary' beyond ~50,000 vectors.
  *
- * The key is the truncated text only, so nothing stops two models sharing a file. Pass
- * `dimensions` to make a cache written by a different-sized model fail loudly on load.
+ * Format 'binary': one append-only file, `${cachePath}.bin`, of self-describing records - the key's
+ * 32 bytes, then the vector as `dimensions` float32 values (platform byte order) - so a key can never
+ * be paired with another text's vector. A checkpoint appends only the new records, so it costs the
+ * same at any size. Requires `dimensions`. A partial record left by an interrupted append is trimmed
+ * (under the lock) before anything else is appended. Vectors are float32 in memory too, so a run and
+ * its rerun return identical values; providers that return doubles lose about 1e-7 relative precision.
+ * Caches in the earlier two-file layout (`.f32` and `.keys`) are converted on first use and left in
+ * place.
+ *
+ * The key is the truncated text only, so nothing stops two models sharing a file. Pass `dimensions`
+ * to make a cache written by a different-sized model fail loudly on load.
  */
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, truncateSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, truncateSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import { truncateText } from './text.ts';
@@ -32,6 +37,7 @@ import { truncateText } from './text.ts';
 export { truncateText };
 
 const sha256 = (s: string) => createHash('sha256').update(s, 'utf8').digest();
+const KEY_BYTES = 32;
 
 export interface CachedEmbedderOptions {
   cachePath: string;
@@ -48,9 +54,49 @@ export interface CachedEmbedderOptions {
   concurrency?: number;
   /** Write the cache every N new embeddings, so an interrupted run keeps what it paid for (default 200). */
   checkpointEvery?: number;
-  /** 'json' (default) or 'binary' (append-only float32; for large caches, needs `dimensions`). See above. */
+  /** 'json' (default) or 'binary' (append-only float32 records; for large caches, needs `dimensions`). See above. */
   format?: 'json' | 'binary';
+  /** How long a save waits for another process's lock before failing (default 60 s). */
+  lockTimeoutMs?: number;
   log?: (line: string) => void;
+}
+
+const sleepSync = (ms: number) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+
+/**
+ * Runs `fn` holding `${path}.lock` (created exclusively). A lock whose owner process is gone, or that
+ * is older than a minute (saves take well under a second), is broken.
+ */
+function withLock<T>(path: string, timeoutMs: number, fn: () => T): T {
+  const lock = `${path}.lock`;
+  const started = Date.now();
+  for (;;) {
+    try {
+      const fd = openSync(lock, 'wx');
+      writeSync(fd, `${process.pid}\n`);
+      closeSync(fd);
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    }
+    try {
+      const owner = Number.parseInt(readFileSync(lock, 'utf8'), 10);
+      let gone = false;
+      if (owner > 0 && owner !== process.pid) {
+        try { process.kill(owner, 0); } catch (e) { gone = (e as NodeJS.ErrnoException).code === 'ESRCH'; }
+      }
+      if (gone || Date.now() - statSync(lock).mtimeMs > 60_000) { unlinkSync(lock); continue; }
+    } catch {
+      continue; // released while we looked
+    }
+    if (Date.now() - started > timeoutMs) throw new Error(`the embedding cache ${path} is locked (${lock}); delete the lock file if no other process is writing`);
+    sleepSync(5 + Math.random() * 20);
+  }
+  try {
+    return fn();
+  } finally {
+    try { unlinkSync(lock); } catch { /* already gone */ }
+  }
 }
 
 export class CachedEmbedder {
@@ -76,20 +122,58 @@ export class CachedEmbedder {
     }
   }
 
-  /** Reads the binary cache, trimming anything after the last complete, matched entry from both files. */
+  private get lockTimeoutMs(): number {
+    return this.options.lockTimeoutMs ?? 60_000;
+  }
+
+  private get binPath(): string {
+    return `${this.cachePath}.bin`;
+  }
+
+  /** Reads the records file (converting a two-file cache first), trimming a partial last record. */
   private loadBinary(d: number): Record<string, ArrayLike<number>> {
-    const vecPath = `${this.cachePath}.f32`, keyPath = `${this.cachePath}.keys`;
+    const record = KEY_BYTES + 4 * d;
+    const bytes = withLock(this.binPath, this.lockTimeoutMs, () => {
+      if (!existsSync(this.binPath)) {
+        const legacy = this.readLegacy(d);
+        if (!legacy) return null;
+        writeFileSync(this.binPath, legacy);
+        this.options.log?.(`  converted the embedding cache ${this.cachePath} to ${this.binPath}`);
+      }
+      const size = statSync(this.binPath).size;
+      if (size % record) truncateSync(this.binPath, size - (size % record));
+      return readFileSync(this.binPath);
+    });
     const cache: Record<string, ArrayLike<number>> = {};
-    if (!existsSync(vecPath) || !existsSync(keyPath)) return cache;
-    const keys = readFileSync(keyPath, 'utf8').split('\n').filter(Boolean);
-    const rows = Math.floor(statSync(vecPath).size / (4 * d));
-    const n = Math.min(keys.length, rows);
-    if (statSync(vecPath).size !== n * 4 * d) truncateSync(vecPath, n * 4 * d);
-    if (keys.length !== n) writeFileSync(keyPath, keys.slice(0, n).map((k) => `${k}\n`).join(''));
-    const buf = readFileSync(vecPath);
-    const all = new Float32Array(buf.buffer, buf.byteOffset, n * d);
-    for (let k = 0; k < n; k++) cache[keys[k]] = all.subarray(k * d, (k + 1) * d);
+    if (!bytes) return cache;
+    // Float32Array views need 4-byte alignment.
+    const buf = bytes.byteOffset % 4 ? new Uint8Array(bytes) : bytes;
+    for (let off = 0; off + record <= buf.byteLength; off += record) {
+      const key = Buffer.from(buf.buffer, buf.byteOffset + off, KEY_BYTES).toString('hex');
+      cache[key] = new Float32Array(buf.buffer, buf.byteOffset + off + KEY_BYTES, d);
+    }
     return cache;
+  }
+
+  /**
+   * The earlier two-file layout (`.f32` rows, `.keys` lines) as records, or null. Keeps entries up to
+   * the last complete, matched one: a key line cut off by an interrupted write is dropped.
+   */
+  private readLegacy(d: number): Uint8Array | null {
+    const vecPath = `${this.cachePath}.f32`, keyPath = `${this.cachePath}.keys`;
+    if (!existsSync(vecPath) || !existsSync(keyPath)) return null;
+    const text = readFileSync(keyPath, 'utf8');
+    const lines = text.split('\n');
+    if (!text.endsWith('\n')) lines.pop();
+    const keys = lines.filter((k) => /^[0-9a-f]{64}$/.test(k));
+    const vectors = readFileSync(vecPath);
+    const n = Math.min(keys.length, Math.floor(vectors.byteLength / (4 * d)));
+    const out = new Uint8Array(n * (KEY_BYTES + 4 * d));
+    for (let k = 0; k < n; k++) {
+      out.set(Buffer.from(keys[k], 'hex'), k * (KEY_BYTES + 4 * d));
+      out.set(vectors.subarray(k * 4 * d, (k + 1) * 4 * d), k * (KEY_BYTES + 4 * d) + KEY_BYTES);
+    }
+    return out;
   }
 
   private checkDimensions(vector: ArrayLike<number>, source: string): void {
@@ -115,6 +199,7 @@ export class CachedEmbedder {
       const size = this.options.embedBatch ? Math.max(1, this.options.batchSize ?? 96) : 1;
       const batches: Array<Array<[string, string]>> = [];
       for (let i = 0; i < missing.length; i += size) batches.push(missing.slice(i, i + size));
+      const binary = this.options.format === 'binary';
       let next = 0;
       let done = 0;
       let lastCheckpoint = 0;
@@ -125,7 +210,8 @@ export class CachedEmbedder {
           const vectors = this.options.embedBatch ? await this.options.embedBatch(inputs) : [await this.options.embed!(inputs[0])];
           if (vectors.length !== batch.length) throw new Error(`embedBatch returned ${vectors.length} vectors for ${batch.length} texts`);
           vectors.forEach((v) => this.checkDimensions(v, 'the embedding provider'));
-          batch.forEach(([key], k) => { this.cache[key] = vectors[k]; this.pending.push(key); });
+          // Binary caches hold float32 from the start, so this run returns what a rerun reads from disk.
+          batch.forEach(([key], k) => { this.cache[key] = binary ? Float32Array.from(vectors[k]) : vectors[k]; this.pending.push(key); });
           done += batch.length;
           if (done - lastCheckpoint >= checkpointEvery) {
             lastCheckpoint = done;
@@ -147,18 +233,32 @@ export class CachedEmbedder {
   private save(): void {
     if (this.options.format === 'binary') {
       if (!this.pending.length) return;
-      const d = this.options.dimensions!;
-      const flat = new Float32Array(this.pending.length * d);
-      this.pending.forEach((key, k) => flat.set(this.cache[key], k * d));
-      // Vectors first, then keys: an interrupted save leaves only unmatched vectors, trimmed on load.
-      appendFileSync(`${this.cachePath}.f32`, new Uint8Array(flat.buffer));
-      appendFileSync(`${this.cachePath}.keys`, this.pending.map((key) => `${key}\n`).join(''));
+      const d = this.options.dimensions!, record = KEY_BYTES + 4 * d;
+      const out = new Uint8Array(this.pending.length * record);
+      this.pending.forEach((key, k) => {
+        out.set(Buffer.from(key, 'hex'), k * record);
+        out.set(new Uint8Array(Float32Array.from(this.cache[key]).buffer), k * record + KEY_BYTES);
+      });
+      withLock(this.binPath, this.lockTimeoutMs, () => {
+        // Another writer's interrupted append must not shift our records.
+        const size = existsSync(this.binPath) ? statSync(this.binPath).size : 0;
+        if (size % record) truncateSync(this.binPath, size - (size % record));
+        appendFileSync(this.binPath, out);
+      });
       this.pending = [];
       return;
     }
-    const tmp = `${this.cachePath}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.cache, (_, v) => (ArrayBuffer.isView(v) ? Array.from(v as Float32Array) : v)));
-    renameSync(tmp, this.cachePath);
+    withLock(this.cachePath, this.lockTimeoutMs, () => {
+      // Keep entries other writers saved since we loaded; ours win where both have a key.
+      if (existsSync(this.cachePath)) {
+        const disk = JSON.parse(readFileSync(this.cachePath, 'utf8')) as Record<string, number[]>;
+        for (const [k, v] of Object.entries(disk)) if (!(k in this.cache)) this.cache[k] = v;
+      }
+      const tmp = `${this.cachePath}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify(this.cache, (_, v) => (ArrayBuffer.isView(v) ? Array.from(v as Float32Array) : v)));
+      renameSync(tmp, this.cachePath);
+    });
+    this.pending = [];
   }
 }
 

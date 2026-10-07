@@ -7,8 +7,8 @@
  *            where x is the embedding, or a knn or stack head's features of it (heads.ts)
  */
 import { decisionFunction, predictIsotonic, sigmoid } from '@liquidau/solvers';
-import { THRESHOLD_MODES } from './conformal.ts';
-import { decodeReference, headFeatureVector, projectedRows, runtimeReference, similarities } from './heads.ts';
+import { THRESHOLD_MODES } from "./conformal.js";
+import { decodeReference, headFeatureVector, projectedRows, runtimeReference, similarities } from "./heads.js";
 /**
  * How a runtime's embedder differs from the one the artifact's heads were trained on (empty when they
  * match). Vectors of the right width can still mean something else - another layer set, precision or

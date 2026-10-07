@@ -297,31 +297,35 @@ test('trainHeads: weak positives are capped, train-only, and reported', () => {
   assert.throws(withBackground, /background example/);
 });
 
-test("cached embedder, format 'binary': append-only checkpoints, resume, repair after an interrupted append", async (t) => {
-  const { appendFileSync, readFileSync, statSync } = await import('node:fs');
+test("cached embedder, format 'binary': append-only records, resume, repair after an interrupted append", async (t) => {
+  const { appendFileSync, statSync } = await import('node:fs');
   const cachePath = join(tempDir(t), 'nested', 'cache');
+  const record = 32 + 4 * 4;
   const calls: string[] = [];
   const embed = async (text: string) => { calls.push(text); return hashEmbedding(text, 4); };
   assert.throws(() => new CachedEmbedder({ cachePath, embed, format: 'binary' }), /needs dimensions/);
   const first = new CachedEmbedder({ cachePath, embed, dimensions: 4, format: 'binary', checkpointEvery: 1, concurrency: 1, log: () => {} });
   const out = await first.embedMany(['alpha', 'beta', 'gamma']);
   assert.deepEqual(out[1], hashEmbedding('beta', 4).map(Math.fround), 'stored as float32');
-  assert.equal(statSync(`${cachePath}.f32`).size, 3 * 4 * 4, 'three float32 rows');
-  assert.equal(readFileSync(`${cachePath}.keys`, 'utf8').split('\n').filter(Boolean).length, 3);
+  assert.equal(statSync(`${cachePath}.bin`).size, 3 * record, 'three records: key and vector');
   // A second instance serves the stored vectors and appends only new ones.
   const second = new CachedEmbedder({ cachePath, embed, dimensions: 4, format: 'binary', log: () => {} });
   await second.embedMany(['alpha', 'delta']);
   assert.deepEqual(calls, ['alpha', 'beta', 'gamma', 'delta'], 'alpha came from the cache');
-  assert.equal(statSync(`${cachePath}.f32`).size, 4 * 4 * 4);
-  // An interrupted append: a partial vector with no key. The next load trims it and keeps going.
-  appendFileSync(`${cachePath}.f32`, new Uint8Array(6));
+  assert.equal(statSync(`${cachePath}.bin`).size, 4 * record);
+  // An interrupted append: a partial record. The next load trims it and keeps going.
+  appendFileSync(`${cachePath}.bin`, new Uint8Array(6));
   const third = new CachedEmbedder({ cachePath, embed, dimensions: 4, format: 'binary', log: () => {} });
-  assert.equal(statSync(`${cachePath}.f32`).size, 4 * 4 * 4, 'trimmed back to the last matched entry');
+  assert.equal(statSync(`${cachePath}.bin`).size, 4 * record, 'trimmed back to the last complete record');
   const [eps] = await third.embedMany(['epsilon']);
   const fourth = new CachedEmbedder({ cachePath, embed, dimensions: 4, format: 'binary', log: () => {} });
-  assert.deepEqual((await fourth.embedMany(['epsilon']))[0], eps, 'the appended vector lines up with its key');
+  assert.deepEqual((await fourth.embedMany(['epsilon']))[0], eps, 'the appended record carries its own key');
   assert.equal(calls.filter((c) => c === 'epsilon').length, 1);
-  // A different-sized model can't read it: its rows wouldn't line up.
+  // A partial record left by another writer after we loaded is trimmed before we append.
+  appendFileSync(`${cachePath}.bin`, new Uint8Array(6));
+  await fourth.embedMany(['zeta']);
+  const fifth = new CachedEmbedder({ cachePath, embed, dimensions: 4, format: 'binary', log: () => {} });
+  assert.deepEqual((await fifth.embedMany(['zeta', 'alpha'])), [hashEmbedding('zeta', 4).map(Math.fround), hashEmbedding('alpha', 4).map(Math.fround)]);
   assert.throws(() => new CachedEmbedder({ cachePath, embed, format: 'binary', dimensions: 0 }), /needs dimensions/);
 });
 

@@ -125,9 +125,9 @@ export function designSample(options) {
             if (!others.length)
                 throw new Error(`the frame has ${small.items.length} items after deduplication; a design needs at least ${minViable}`);
             const tiers = [
-                (c) => c.rule === small.rule && c.slice === small.slice && adjacent(small, c),
-                (c) => c.rule === small.rule && overlap(small, c),
-                (c) => c.slice === small.slice && overlap(small, c),
+                (c) => c.rule === small.rule && c.slice === small.slice && adjacent(small, c), // neighbouring band
+                (c) => c.rule === small.rule && overlap(small, c), // same band, another slice
+                (c) => c.slice === small.slice && overlap(small, c), // same band, other rule firing
                 () => true,
             ];
             const into = tiers.map((t) => others.filter(t)).find((x) => x.length).sort(bySize)[0];

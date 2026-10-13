@@ -70,6 +70,8 @@ export interface HeadEvaluation {
     false_alarm_rate: number;
     precision_prevalence_weighted: number;
     ece_prevalence_weighted: number;
+    /** Test rows the calibration diagnostics were computed on (rows the head scored itself; absent: all). */
+    calibration_rows?: number;
     reliability: ReliabilityRow[];
     slices: Record<string, {
         positives: number;
@@ -133,5 +135,12 @@ export interface EvaluateInput {
         replicates?: number;
         seed?: number;
     };
+    /**
+     * Rows the head scores itself (default: all). Calibration diagnostics (ECE, the reliability table,
+     * the Cox test) use only these: rows decided before the head (dismissal rules, the edge tier) carry
+     * preset probabilities of 0 or 1 that say nothing about the calibrator. Recall, false alarms and
+     * precision still count every row.
+     */
+    scored?: readonly boolean[];
 }
-export declare function evaluateHead({ p, y, w, threshold, groups, slices, baseline, delta, prevalence, design }: EvaluateInput): HeadEvaluation;
+export declare function evaluateHead({ p, y, w, threshold, groups, slices, baseline, delta, prevalence, design, scored }: EvaluateInput): HeadEvaluation;

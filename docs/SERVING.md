@@ -45,7 +45,8 @@ of messages skipping the embedding where that is allowed.
 
 The deterministic rules can run in their own small function (a Lambda or an edge Worker: rule-miner
 and this package's root import no Node built-ins) and send only the messages they can't settle to
-the model's function.
+the model's function. `@liquidau/router` provides both tiers for a complete release (`loadRulesTier`
+and `routeForwarded`, pinned to one manifest digest; see its README). Built from this package alone:
 
 1. **Rules tier:** `evaluation = ruleSetMatcher(set).evaluate(text)`, then
    `settleWithRules(policy, evaluation)`. Settled: answer, and forward a random share (5%, say) for

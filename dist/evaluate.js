@@ -67,10 +67,10 @@ function designEvaluation(p, y, fired, design, slices, baseline) {
         } : {}),
     };
 }
-export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline, delta = 0.05, prevalence, design }) {
+export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline, delta = 0.05, prevalence, design, scored }) {
     if (!(delta > 0 && delta < 1))
         throw new Error(`delta must be strictly between 0 and 1, got ${delta}`);
-    const lengths = [['y', y], ['w', w], ['groups', groups], ['baseline', baseline], ['design.inclusionProbs', design?.inclusionProbs], ['design.strata', design?.strata], ...Object.entries(slices).map(([f, v]) => [`slices.${f}`, v])];
+    const lengths = [['y', y], ['w', w], ['groups', groups], ['baseline', baseline], ['scored', scored], ['design.inclusionProbs', design?.inclusionProbs], ['design.strata', design?.strata], ...Object.entries(slices).map(([f, v]) => [`slices.${f}`, v])];
     for (const [name, values] of lengths) {
         if (values !== undefined && values.length !== p.length)
             throw new Error(`${name} has ${values.length} entries but p has ${p.length}`);
@@ -89,7 +89,9 @@ export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline
             wTp += w[i] * y[i];
         }
     });
-    const calibration = ece(p, y, w);
+    const keep = (v) => (scored ? v.filter((_, i) => scored[i]) : [...v]);
+    // With every row decided before the head there is nothing to judge the calibrator on.
+    const calibration = keep(w).reduce((a, v) => a + v, 0) > 0 ? ece(keep(p), keep(y), keep(w)) : { ece: NaN, reliability: [] };
     // Per group: [all members fired, any member fired], separately for each class.
     const byGroup = [new Map(), new Map()];
     p.forEach((_, i) => {
@@ -124,6 +126,7 @@ export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline
         false_alarm_rate: neg ? fp / neg : NaN,
         precision_prevalence_weighted: wFired ? wTp / wFired : NaN,
         ece_prevalence_weighted: calibration.ece,
+        ...(scored ? { calibration_rows: scored.filter(Boolean).length } : {}),
         reliability: calibration.reliability,
         slices: {},
         certified,
@@ -149,15 +152,16 @@ export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline
         result.combined_recall_ci95 = wilson(combined, pos);
         result.combined_false_alarm_rate = neg ? count((i) => y[i] === 0 && (baseline[i] || fired[i])) / neg : NaN;
     }
-    if (y.some((v) => v === 1) && y.some((v) => v === 0)) {
+    const pc = keep(p), yc = keep(y), wc = keep(w);
+    if (yc.some((v) => v === 1) && yc.some((v) => v === 0)) {
         const clip = (v) => Math.min(1 - 1e-12, Math.max(1e-12, v));
-        const c = coxTest(p.map(clip), y, w);
+        const c = coxTest(pc.map(clip), yc, wc);
         const converged = c.converged !== false;
         // Complete separation: every positive scores above every negative, so the maximum-likelihood slope is infinite.
         let minPos = Infinity, maxNeg = -Infinity;
-        p.forEach((v, i) => { if (y[i] === 1)
+        pc.forEach((v, i) => { if (yc[i] === 1)
             minPos = Math.min(minPos, v);
-        else if (y[i] === 0)
+        else if (yc[i] === 0)
             maxNeg = Math.max(maxNeg, v); });
         const separated = minPos > maxNeg;
         result.calibration_test = { intercept: c.intercept, slope: c.slope, lr: c.lr, p_value: c.pValue, stable: converged && !separated && Math.abs(c.intercept) <= 10 && Math.abs(c.slope) <= 10 };

@@ -18,6 +18,17 @@ below are the threshold and gate entries from [API.md](API.md).
 The conformal modes and `auto` refuse unequal inclusion probabilities, so design-sampled
 calibration needs `design`. Precision heads accept only `heuristic` and `design`.
 
+**When tiers run first.** A head certified behind dismissal rules, the edge or the middle tier has its
+threshold chained to their claims, which were certified on the same calibration sample. Its `delta`
+holds given those earlier thresholds, not jointly with them. The guarantee records this as
+`chain: { claims, ladder, joint_delta }`:
+- `claims` counts the dismissal rules as 1, the edge as 2 and the middle tier as 2;
+- `ladder` is how many edge candidates were tried before this one was kept;
+- `joint_delta` = min(1, ladder × (claims + 1) × delta) is a union bound on any of them failing.
+
+Read `1 − joint_delta` as the confidence of the whole pipeline. For a joint statement at a chosen level,
+certify each claim at that level divided by (claims + 1), or keep a calibration sample per tier.
+
 **The default is the strongest guarantee the data supports** (since 0.7): `design` with sampled
 calibration records, else `auto` without the silent heuristic fallback; a head the data can't
 support fails its gates, and can still be served in shadow mode. `heuristic` carries no guarantee
@@ -51,6 +62,27 @@ threshold applies to every message alike.
 | `background` (`trainHeads`) / `budgetThreshold` | Raise a head's threshold until it fires on at most a given share of ordinary background traffic, before test evaluation, so the gates judge the shipped threshold. Labelled test sets rarely contain enough ordinary text to show the false alarms that matter |
 | `certified` (`evaluateHead`) | Exact Clopper–Pearson bounds from the test split, valid whatever chose the threshold: recall lower and upper, false-alarm upper, and precision lower at production prevalence. Groups count once. Plus a background-rate upper bound that stays valid when the background set the threshold. Under a conformal guarantee, the recall gate fails only when the test split contradicts it |
 | `reviewEpsilon` (`trainHeads`) | A conformal review floor: at most ε of positives score below it in expectation, so automatic dismissals have a stated miss rate |
+
+## Recall reserve and the edge tier
+
+**Reserve.** `HeadPolicy.reserve` (recall heads, default 0) certifies the threshold at `targetRecall +
+reserve` while the gates and the stated promise stay at `targetRecall`. It is insurance against later
+periods: a guarantee on one period can't vouch for the next (FINDINGS O2 in liquidau-lab). It helps
+only where the later period drifts and costs false alarms everywhere, so set it per head from
+evidence of drift.
+
+**Edge tier.** With `HeadInput.edge` (trainEdge's rows), the edge's dismissed rows score 0 and its fired
+rows 1 before the threshold is chosen, so the certified recall covers the edge and the head together
+(a dismissed positive is a miss), and the edge's fires count against the firing budget. The edge's
+own fire and dismiss thresholds are chosen on the same calibration rows, a mild optimism to keep in
+mind at small samples.
+
+**Calibration gates with rows decided before the head.** Rows the dismissal rules or the edge decided
+carry preset probabilities (0 or 1) that say nothing about the calibrator, so ECE, the reliability
+table and the Cox test use only the rows the head scored itself (`evaluateHead`'s `scored`;
+`calibration_rows` records how many). With fewer than 100 such test rows the ECE gate warns instead
+of failing: an edge that decides 99% of a head's traffic leaves too few rows to judge calibration on
+(in the lab, 29 rows gave an ECE of 0.13 on a head whose guarantee and later-period promise held).
 
 ## Gates and checks
 

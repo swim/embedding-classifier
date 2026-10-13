@@ -156,7 +156,11 @@ export function designSample(options) {
     // positives in the prior round isn't treated as holding a material share (its smoothed rate is only
     // there to keep a material stratum's size finite) - the thin-strata warnings watch for that risk.
     const rateSets = [];
-    if (allocation.method === 'expected-positives') {
+    if (allocation.method === 'neyman' && !allocation.prior)
+        throw new Error("neyman allocation needs prior: one positive rate per stratum");
+    if (allocation.method === 'neyman' && allocation.priors)
+        throw new Error("neyman allocation takes a single prior, not priors");
+    if (allocation.method === 'expected-positives' || allocation.method === 'neyman') {
         if (!(minExpected > 0))
             throw new Error(`minExpectedPositives must be positive, got ${minExpected}`);
         if (!!allocation.prior === !!allocation.priors)
@@ -182,6 +186,8 @@ export function designSample(options) {
         }
     }
     const rates = rateSets.length === 1 && rateSets[0].head === '' ? rateSets[0].rates : null;
+    // Neyman uses the rates only to allocate; the expected-positives sizing check below is for proportional sizing.
+    const neymanRates = allocation.method === 'neyman' ? rateSets.splice(0).at(0).rates : null;
     // Proportional n_h = total · N_h / ΣN, so stratum h's calibration (and test) share expects
     // total · (N_h / ΣN) · share · rate_h positives: the smallest sufficient total over material strata.
     const share = Math.min(roleSplit.calibration, roleSplit.test);
@@ -221,12 +227,16 @@ export function designSample(options) {
     }
     else {
         // Proportional with floors and caps: find c with Σ clamp(c·f_h·N_h, floor_h, N_h) = total, where
-        // f_h = topFactor for strata in the top score band and 1 otherwise.
+        // f_h = topFactor for strata in the top score band and 1 otherwise (Neyman: f_h = √(p_h(1 − p_h))).
         const total = Math.min(allocation.total, N.reduce((a, b) => a + b, 0));
         const inTop = new Map(cells.map((c) => [c.name, Math.min(...c.bands) === 0]));
-        const f = names.map((h) => (inTop.get(h) ? topFactor : 1));
-        let lo = 0, hi = 1 / Math.min(...f);
+        const f = neymanRates ? neymanRates.map((r) => Math.sqrt(r * (1 - r))) : names.map((h) => (inTop.get(h) ? topFactor : 1));
+        if (neymanRates && !f.some((v) => v > 0))
+            throw new Error('neyman allocation needs a prior rate strictly between 0 and 1 in at least one stratum');
         const at = (c) => N.reduce((s, Nh, i) => s + Math.min(Nh, Math.max(floors[i], c * f[i] * Nh)), 0);
+        let lo = 0, hi = 1;
+        while (at(hi) < total && hi < 1e12)
+            hi *= 2;
         for (let it = 0; it < 200; it++) {
             const mid = (lo + hi) / 2;
             if (at(mid) < total)
@@ -235,6 +245,14 @@ export function designSample(options) {
                 hi = mid;
         }
         n = roundWithin(N.map((Nh, i) => Math.min(Nh, Math.max(floors[i], hi * f[i] * Nh))), floors, N, total);
+        if (neymanRates) {
+            names.forEach((h, i) => {
+                if (n[i] === floors[i] && floors[i] < N[i])
+                    warnings.push(`neyman: stratum ${h} (prior rate ${neymanRates[i]}) is at its floor of ${floors[i]}`);
+                else if (n[i] === N[i])
+                    warnings.push(`neyman: stratum ${h} is taken whole (N = ${N[i]})`);
+            });
+        }
         if (topFactor !== 1)
             warnings.push(`allocation.topFactor ${topFactor}: valid only if signals.score (${scoringModel}) is independent of the head being certified, e.g. an offline teacher's score; oversampling by the head's own score makes recall bounds under-cover`);
         if (topFactor > 4)
@@ -261,6 +279,7 @@ export function designSample(options) {
         return {
             name, N: N[i], n: n[i], pi: n[i] / N[i], roles: counts, band: range,
             ...(rates ? { priorRate: rates[i], expectedCalibrationPositives: rates[i] * nCal } : {}),
+            ...(neymanRates ? { priorRate: neymanRates[i], expectedCalibrationPositives: neymanRates[i] * nCal } : {}),
         };
     });
     const summary = {
@@ -270,6 +289,7 @@ export function designSample(options) {
             ...(topFactor !== 1 ? { topFactor } : {}),
             ...(rateSets.length ? { minExpectedPositives: minExpected, minShare, requiredTotal } : {}),
             ...(rates ? { priorRates: Object.fromEntries(names.map((h, i) => [h, rates[i]])) } : {}),
+            ...(neymanRates ? { priorRates: Object.fromEntries(names.map((h, i) => [h, neymanRates[i]])) } : {}),
             ...(rateSets.length && !rates ? { priorRatesByHead: Object.fromEntries(rateSets.map((s) => [s.head, Object.fromEntries(names.map((h, i) => [h, s.rates[i]]))])) } : {}),
         },
     };

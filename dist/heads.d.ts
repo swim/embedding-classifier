@@ -1,3 +1,4 @@
+import type { FinerFeatures } from './finer.ts';
 import type { HeadPolicy } from './threshold.ts';
 export type HeadType = 'linear' | 'knn' | 'stack';
 export declare const HEAD_TYPES: readonly HeadType[];
@@ -16,7 +17,9 @@ export type HeadFeatures = {
         mean: number[];
         components: number[][];
     };
-};
+}
+/** The embedding plus the finer-label route score (finer.ts): scored with the artifact's finer model, not the reference. */
+ | FinerFeatures;
 /** The artifact's shared reference rows. */
 export interface ReferenceSet {
     /**
@@ -69,7 +72,9 @@ export declare function projectedRows(head: string, features: Extract<HeadFeatur
     kind: 'stack';
 }>, ref: RuntimeReference): number[][];
 /** Features for one head at runtime; `sims` are the embedding's cosines to every reference row (computed once per message). */
-export declare function headFeatureVector(head: string, features: HeadFeatures, embedding: ArrayLike<number>, ref: RuntimeReference, sims: ArrayLike<number>): number[];
+export declare function headFeatureVector(head: string, features: Exclude<HeadFeatures, {
+    kind: 'finer';
+}>, embedding: ArrayLike<number>, ref: RuntimeReference, sims: ArrayLike<number>): number[];
 /** Fold of a row (FNV-style hash of its key). */
 export declare function foldOf(key: string): number;
 export interface FeatureTraining {

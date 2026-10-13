@@ -64,7 +64,15 @@ export function gateHead(policy, ev, options = {}) {
             warnings.push(`precision rests on only ${ev.fired} fired test examples and no minFired gate is set`);
         }
     }
-    if (!(ev.ece_prevalence_weighted <= maxEce))
+    // Rows decided before the head (rules, the edge) leave it few scored rows; ECE on a handful is noise.
+    const MIN_CALIBRATION_ROWS = 100;
+    if (Number.isNaN(ev.ece_prevalence_weighted))
+        warnings.push('calibration not checked: no test rows were left to the head (the rules or the edge decided them all)');
+    else if (ev.calibration_rows !== undefined && ev.calibration_rows < MIN_CALIBRATION_ROWS) {
+        if (!(ev.ece_prevalence_weighted <= maxEce))
+            warnings.push(`ECE ${ev.ece_prevalence_weighted.toFixed(3)} > ${maxEce} on only ${ev.calibration_rows} test rows left to the head (fewer than ${MIN_CALIBRATION_ROWS}: too few to judge calibration)`);
+    }
+    else if (!(ev.ece_prevalence_weighted <= maxEce))
         failures.push(`ECE ${ev.ece_prevalence_weighted.toFixed(3)} > ${maxEce}`);
     if (calibrationAlpha !== undefined && ev.calibration_test && ev.calibration_test.stable === false) {
         warnings.push(`calibration test not applied: the recalibration fit is unstable (intercept ${ev.calibration_test.intercept.toFixed(1)}, slope ${ev.calibration_test.slope.toFixed(1)}) - the scores separate the classes almost perfectly`);

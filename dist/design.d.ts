@@ -73,7 +73,15 @@ export interface DesignOptions {
     mergeSmallStrata?: boolean;
     allocation: {
         total: number;
-        method: 'proportional' | 'manual' | 'expected-positives';
+        /**
+         * 'neyman': n_h ∝ N_h·√(p_h(1 − p_h)), with p_h from `prior` (a prior independent round, or an
+         * offline teacher's mean score per stratum, fixed before drawing): the allocation that minimises
+         * the variance of an estimated positive rate, putting labels where the label is uncertain. Floors
+         * (minPerStratum) and caps (N_h) apply as for proportional. Unequal fractions lower the Kish
+         * effective number of positives that design-based recall bounds rest on, so check guarantees
+         * before adopting it at large budgets (the lab's Neyman stage, L7).
+         */
+        method: 'proportional' | 'manual' | 'expected-positives' | 'neyman';
         manual?: Record<string, number>;
         /**
          * expected-positives: per stratum name, the positive rate from a prior, independent round -

@@ -4,11 +4,19 @@
  * runs.
  *
  * Per head:  logit = w·x + b  ->  calibrated p (Platt: σ(a·logit + c) | isotonic: interp(σ(logit)))
- *            where x is the embedding, or a knn or stack head's features of it (heads.ts)
+ *            where x is the embedding, or a knn or stack head's features of it (heads.ts), or the
+ *            embedding plus a finer head's route score (finer.ts)
  */
 import { decisionFunction, predictIsotonic, sigmoid } from '@liquidau/solvers';
 import { THRESHOLD_MODES } from "./conformal.js";
 import { decodeReference, headFeatureVector, projectedRows, runtimeReference, similarities } from "./heads.js";
+import { finerFeatureVector, finerProbabilities, validateFinerModel } from "./finer.js";
+import { edgeHeadDigest } from "./edge.js";
+import { middleHeadDigest } from "./middle.js";
+/** The width of the heads' input: the embedding's dimensions, plus its context's when the artifact has context features. */
+export function featureWidth(spec) {
+    return spec.dimensions + (spec.context?.dimensions ?? 0);
+}
 /**
  * How a runtime's embedder differs from the one the artifact's heads were trained on (empty when they
  * match). Vectors of the right width can still mean something else - another layer set, precision or
@@ -16,7 +24,7 @@ import { decodeReference, headFeatureVector, projectedRows, runtimeReference, si
  */
 export function checkEmbeddingSpec(artifact, runtime) {
     const a = artifact.embedding;
-    const fields = ['model_id', 'dimensions', 'normalize', 'input_type', 'layers', 'pooling', 'layer_normalize', 'precision', 'max_chars'];
+    const fields = ['model_id', 'dimensions', 'normalize', 'input_type', 'layers', 'pooling', 'layer_normalize', 'precision', 'max_chars', 'context'];
     return fields
         .filter((f) => JSON.stringify(a[f] ?? null) !== JSON.stringify(runtime[f] ?? null))
         .map((f) => `embedding ${f}: the artifact was trained with ${JSON.stringify(a[f] ?? null)}, the runtime gives ${JSON.stringify(runtime[f] ?? null)}`);
@@ -44,7 +52,7 @@ export function calibrate(calibration, logit) {
 /** A linear head's probability (knn and stack heads need the artifact's reference: use scoreEmbedding). */
 export function headProbability(spec, embedding) {
     if (spec.features)
-        throw new Error(`a ${spec.features.kind} head needs the artifact's reference: score it with scoreEmbedding`);
+        throw new Error(`a ${spec.features.kind} head needs the artifact's ${spec.features.kind === 'finer' ? 'finer model' : 'reference'}: score it with scoreEmbedding`);
     return calibrate(spec.calibration, decisionFunction({ coef: spec.weights, intercept: spec.bias }, embedding));
 }
 const isFiniteNumber = (v) => typeof v === 'number' && Number.isFinite(v);
@@ -71,32 +79,23 @@ export function validateArtifact(raw, options = {}) {
     }
     if (options.mode === 'enforce' && a.gates?.passed !== true)
         throw new Error('refusing to enforce an artifact whose gates did not pass (or were not recorded): serve it in shadow mode, or retrain');
-    const dims = a.embedding.dimensions;
-    if (!Number.isInteger(dims) || dims < 1)
-        throw new Error(`embedding dimensions must be a positive integer, got ${dims}`);
-    const { layers, pooling, layer_normalize: layerNormalize, max_chars: maxChars } = a.embedding;
-    if (layers !== undefined) {
-        if (!Array.isArray(layers) || !layers.length || !layers.every((l) => Number.isInteger(l) && l >= 1) || new Set(layers).size !== layers.length) {
-            throw new Error('embedding layers must be distinct positive integers');
-        }
-        if (dims % layers.length !== 0)
-            throw new Error(`embedding dimensions ${dims} don't split evenly over ${layers.length} layers`);
-        if (pooling !== 'mean')
-            throw new Error("embedding layers need pooling 'mean'");
-        if (typeof layerNormalize !== 'boolean')
-            throw new Error('embedding layers need layer_normalize (true or false)');
+    validateEmbeddingSpec(a.embedding, 'embedding');
+    if (a.embedding.context !== undefined) {
+        if (!a.embedding.context || typeof a.embedding.context !== 'object' || 'context' in a.embedding.context)
+            throw new Error('embedding context must be one encoder spec, without context of its own');
+        validateEmbeddingSpec(a.embedding.context, 'embedding context');
     }
-    else if (pooling !== undefined || layerNormalize !== undefined)
-        throw new Error('embedding pooling and layer_normalize apply only with layers');
-    if (maxChars !== undefined && !(Number.isInteger(maxChars) && maxChars > 0))
-        throw new Error('embedding max_chars must be a positive integer');
+    // The heads' input width: the message embedding, plus the context's when there is one.
+    const dims = featureWidth(a.embedding);
     if (a.reference !== undefined)
         validateReference(a.reference, dims);
+    if (a.finer !== undefined)
+        validateFinerModel(a.finer, dims);
     routerRuleSetHash(a);
     for (const [name, spec] of Object.entries(a.heads)) {
         if (options.heads && !options.heads.includes(name))
             throw new Error(`unknown head ${name}`);
-        const width = spec?.features ? validateFeatures(name, spec.features, dims, a.reference) : dims;
+        const width = spec?.features ? validateFeatures(name, spec.features, dims, a.reference, a.finer) : dims;
         if (!spec || !Array.isArray(spec.weights) || spec.weights.length !== width) {
             throw new Error(`head ${name} has ${spec?.weights?.length} weights but ${spec?.features ? `its ${spec.features.kind} features have` : 'the embedding has'} ${width} dimensions`);
         }
@@ -140,11 +139,41 @@ export function validateArtifact(raw, options = {}) {
         if (dm !== undefined && !(dm && typeof dm.rule_set === 'string' && isRate(dm.max_rate) && Number.isInteger(dm.certified) && dm.certified >= 0)) {
             throw new Error(`head ${name} has an invalid dismissal record`);
         }
+        if (spec.edge !== undefined && !(spec.edge && typeof spec.edge.model_sha256 === 'string' && /^[0-9a-f]{64}$/.test(spec.edge.model_sha256))) {
+            throw new Error(`head ${name} has an invalid edge record`);
+        }
+        if (spec.middle !== undefined && !(spec.middle && typeof spec.middle.model_sha256 === 'string' && /^[0-9a-f]{64}$/.test(spec.middle.model_sha256))) {
+            throw new Error(`head ${name} has an invalid middle record`);
+        }
+        if (spec.middle && !spec.edge)
+            throw new Error(`head ${name} has a middle record but no edge record (the middle tier sits behind the edge)`);
         if (spec.review_epsilon !== undefined && !(isFiniteNumber(spec.review_epsilon) && spec.review_epsilon > 0 && spec.review_epsilon < 1)) {
             throw new Error(`head ${name} has a review_epsilon outside (0, 1)`);
         }
     }
     return a;
+}
+/** Throws unless `spec` is a usable embedding identity (its context, if any, is checked separately). */
+export function validateEmbeddingSpec(spec, what) {
+    const dims = spec.dimensions;
+    if (!Number.isInteger(dims) || dims < 1)
+        throw new Error(`${what} dimensions must be a positive integer, got ${dims}`);
+    const { layers, pooling, layer_normalize: layerNormalize, max_chars: maxChars } = spec;
+    if (layers !== undefined) {
+        if (!Array.isArray(layers) || !layers.length || !layers.every((l) => Number.isInteger(l) && l >= 1) || new Set(layers).size !== layers.length) {
+            throw new Error(`${what} layers must be distinct positive integers`);
+        }
+        if (dims % layers.length !== 0)
+            throw new Error(`${what} dimensions ${dims} don't split evenly over ${layers.length} layers`);
+        if (pooling !== 'mean')
+            throw new Error(`${what} layers need pooling 'mean'`);
+        if (typeof layerNormalize !== 'boolean')
+            throw new Error(`${what} layers need layer_normalize (true or false)`);
+    }
+    else if (pooling !== undefined || layerNormalize !== undefined)
+        throw new Error(`${what} pooling and layer_normalize apply only with layers`);
+    if (maxChars !== undefined && !(Number.isInteger(maxChars) && maxChars > 0))
+        throw new Error(`${what} max_chars must be a positive integer`);
 }
 function validateReference(ref, dims) {
     if (!ref || typeof ref !== 'object' || (ref.encoding !== 'f32' && ref.encoding !== 'int8'))
@@ -175,7 +204,17 @@ function validateReference(ref, dims) {
     }
 }
 /** Checks a head's feature block and returns its width. */
-function validateFeatures(name, f, dims, ref) {
+function validateFeatures(name, f, dims, ref, finer) {
+    if (f?.kind === 'finer') {
+        if (!finer)
+            throw new Error(`head ${name} is a finer head but the artifact has no finer model`);
+        const r = f.route_rates;
+        if (!Array.isArray(r) || r.length !== finer.classes.length || !r.every((v) => isFiniteNumber(v) && v >= 0 && v <= 1))
+            throw new Error(`head ${name} needs one route rate in [0, 1] per finer label (${finer.classes.length})`);
+        if (!(isFiniteNumber(f.scale) && f.scale !== 0))
+            throw new Error(`head ${name} has an invalid finer scale`);
+        return dims + 1;
+    }
     if (!f || (f.kind !== 'knn' && f.kind !== 'stack'))
         throw new Error(`head ${name} has unknown features ${f?.kind}`);
     if (!Number.isInteger(f.k) || f.k < 1)
@@ -216,6 +255,12 @@ function validateGuarantee(name, g) {
         if (g[k] !== undefined && (g.kind === 'none' || !isRate(g[k])))
             throw new Error(`head ${name}: guarantee ${k} must be in (0, 1) and only with a guarantee`);
     }
+    if (g.chain !== undefined) {
+        const c = g.chain;
+        if (!withDelta || !c || !(Number.isInteger(c.claims) && c.claims >= 0 && Number.isInteger(c.ladder) && c.ladder >= 1 && typeof c.joint_delta === 'number' && c.joint_delta >= g.delta && c.joint_delta <= 1)) {
+            throw new Error(`head ${name}: guarantee chain must be { claims >= 0, ladder >= 1, joint_delta in [delta, 1] } on a pac or design guarantee`);
+        }
+    }
 }
 /**
  * Builds the artifact's runtime scoring state now (decoded reference rows, stack heads' projected
@@ -233,8 +278,9 @@ export function prepareScoring(artifact) {
 }
 /** Calibrated probability for every head in the artifact. */
 export function scoreEmbedding(artifact, embedding) {
-    if (embedding.length !== artifact.embedding.dimensions) {
-        throw new Error(`embedding has ${embedding.length} dimensions but the artifact expects ${artifact.embedding.dimensions}`);
+    const width = featureWidth(artifact.embedding);
+    if (embedding.length !== width) {
+        throw new Error(`embedding has ${embedding.length} dimensions but the artifact expects ${width}${artifact.embedding.context ? ' (the message and its context, concatenated)' : ''}`);
     }
     for (let i = 0; i < embedding.length; i++) {
         if (!Number.isFinite(embedding[i]))
@@ -242,12 +288,20 @@ export function scoreEmbedding(artifact, embedding) {
     }
     const scores = {};
     // knn and stack heads share one pass over the reference per message.
-    let ref, sims;
+    let ref, sims, finerP;
     for (const [head, spec] of Object.entries(artifact.heads)) {
         if (!spec)
             continue;
         if (!spec.features) {
             scores[head] = headProbability(spec, embedding);
+            continue;
+        }
+        if (spec.features.kind === 'finer') {
+            // Finer heads share one pass of the finer model per message.
+            if (!artifact.finer)
+                throw new Error(`head ${head} is a finer head but the artifact has no finer model`);
+            finerP ??= finerProbabilities(artifact.finer, embedding);
+            scores[head] = calibrate(spec.calibration, decisionFunction({ coef: spec.weights, intercept: spec.bias }, finerFeatureVector(spec.features, embedding, finerP)));
             continue;
         }
         if (!artifact.reference)
@@ -268,4 +322,55 @@ export function checkRuleSetPairing(artifact, ruleSet) {
     return Object.entries(artifact.heads)
         .filter(([, spec]) => spec?.dismissal && spec.dismissal.rule_set !== ruleSet)
         .map(([head, spec]) => `${head} was certified with rule set ${spec.dismissal.rule_set}, not ${ruleSet}`);
+}
+/**
+ * The edge and middle tiers a release runs against what each head was certified with: every certified
+ * edge or middle digest must equal the running document's head digest, a tier may decide only for heads
+ * certified with it, and a middle head's thresholds must have been certified behind the edge model the
+ * release runs. Empty when they pair.
+ */
+export function checkTierPairing(artifact, edge, middle) {
+    const p = checkEdgePairing(artifact, edge);
+    const middleHeads = middle ? Object.keys(middle.heads) : [];
+    for (const [head, spec] of Object.entries(artifact.heads)) {
+        const certified = spec?.middle?.model_sha256;
+        const running = middle ? middleHeadDigest(middle, head) : null;
+        if (certified && certified !== running)
+            p.push(`${head} was certified with middle model ${certified}, but the release ${running ? `runs ${running}` : middle ? `has no middle model for ${head}` : 'has no middle tier'}`);
+        if (!certified && running)
+            p.push(`the middle tier decides for ${head}, but ${head} was not certified with it`);
+    }
+    for (const head of middleHeads) {
+        if (!(head in artifact.heads)) {
+            p.push(`the middle tier has a model for ${head}, which the classifier doesn't have`);
+            continue;
+        }
+        const prior = middle.heads[head].claims.prior_edge_sha256;
+        const edgeRunning = edge ? edgeHeadDigest(edge, head) : null;
+        if (prior !== edgeRunning)
+            p.push(`the middle model for ${head} was certified behind edge model ${prior}, but the release ${edgeRunning ? `runs ${edgeRunning}` : `has no edge model for ${head}`}`);
+    }
+    return p;
+}
+/**
+ * Heads whose certification doesn't match the edge the release runs (`edge`: the release's edge
+ * document, null without one): a head certified with an edge model needs exactly that model in the
+ * document (edgeHeadDigest), and a model the edge runs for a head needs the head certified with it.
+ * Refuse to serve while this is non-empty.
+ */
+export function checkEdgePairing(artifact, edge) {
+    const p = [];
+    const edgeHeads = edge ? Object.keys(edge.heads) : [];
+    for (const [head, spec] of Object.entries(artifact.heads)) {
+        const certified = spec?.edge?.model_sha256;
+        const running = edge ? edgeHeadDigest(edge, head) : null;
+        if (certified && certified !== running)
+            p.push(`${head} was certified with edge model ${certified}, but the release ${running ? `runs ${running}` : edge ? `has no edge model for ${head}` : 'has no edge'}`);
+        if (!certified && running)
+            p.push(`the edge decides for ${head}, but ${head} was not certified with it`);
+    }
+    for (const head of edgeHeads)
+        if (!(head in artifact.heads))
+            p.push(`the edge has a model for ${head}, which the classifier doesn't have`);
+    return p;
 }

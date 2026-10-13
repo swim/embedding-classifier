@@ -400,6 +400,8 @@ export function validateDocumentArtifact(raw) {
     if (classifier) {
         if (classifier.reference !== undefined)
             p.push('document classifiers are linear only: the classifier must not carry a reference set');
+        if (classifier.finer !== undefined)
+            p.push('document classifiers are linear only: the classifier must not carry a finer model');
         for (const [h, spec] of Object.entries(classifier.heads))
             if (spec?.features)
                 p.push(`head ${h}: document heads are linear only`);

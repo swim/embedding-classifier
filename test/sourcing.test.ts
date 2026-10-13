@@ -572,3 +572,29 @@ test('designSample topFactor: top band oversampled, total kept, factor 1 unchang
   }
   assert.ok(Math.abs(sum / draws - truthRate) < 0.003, `mean HT prevalence ${sum / draws} vs ${truthRate}`);
 });
+
+test("designSample: Neyman allocation follows N_h·√(p_h(1 − p_h)) within floors and caps", () => {
+  const strata = design().design.strata.map((s) => s.name);
+  // Rates per stratum: the uncertain top band gets most per unit; the bottom band, almost certainly negative, only its floor.
+  const prior = Object.fromEntries(strata.map((h) => [h, h.includes('band0') ? 0.4 : h.includes('band1') ? 0.08 : 1e-5]));
+  const d = designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 800, method: 'neyman', prior }, scoringModel: 'old-v1', seed: 7 });
+  assert.equal(d.design.allocation.method, 'neyman');
+  assert.deepEqual(d.design.allocation.priorRates, prior);
+  assert.equal(d.records.length, 800);
+  const sized = d.design.strata.filter((s) => s.n > Math.min(30, s.N) && s.n < s.N);
+  // Strata between their floor and their size are allocated in proportion to N_h·√(p(1 − p)), up to rounding.
+  const ratio = sized.map((s) => s.n / (s.N * Math.sqrt(prior[s.name] * (1 - prior[s.name]))));
+  assert.ok(sized.length >= 2, `${sized.length} strata between floor and size`);
+  for (const r of ratio) assert.ok(Math.abs(r / ratio[0] - 1) < 0.05, `allocation ratios ${ratio.map((v) => v.toFixed(3)).join(', ')}`);
+  // The near-certain bottom strata sit at their floor, with a warning saying so.
+  for (const s of d.design.strata.filter((x) => x.name.includes('band2'))) assert.equal(s.n, Math.min(30, s.N));
+  assert.ok(d.design.warnings.some((w) => /neyman: stratum .*band2.* is at its floor/.test(w)));
+  // Each role remains its own stratified sample, so the design estimators work unchanged.
+  for (const r of d.records) {
+    const s = d.design.strata.find((x) => x.name === (r.source as { stratum: string }).stratum)!;
+    assert.equal((r.source as { inclusionProb: number }).inclusionProb, s.roles[r.role as Split] / s.N);
+  }
+  assert.throws(() => designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 1600, method: 'neyman' }, scoringModel: 'm', seed: 1 }), /neyman allocation needs prior/);
+  assert.throws(() => designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 1600, method: 'neyman', prior: Object.fromEntries(strata.map((h) => [h, 1])) }, scoringModel: 'm', seed: 1 }), /strictly between 0 and 1 in at least one stratum/);
+  assert.throws(() => designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 20, method: 'neyman', prior }, scoringModel: 'm', seed: 1 }), /below the \d+ that minPerStratum 30 needs/);
+});

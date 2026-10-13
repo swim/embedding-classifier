@@ -33,6 +33,12 @@ export type HeadPolicy = {
     /** Heuristic threshold selection target on the calibration split (>= targetRecall). Required for `heuristic`, and as `auto`'s last resort. */
     designRecall?: number;
     /**
+     * Recall held in reserve for later periods: the threshold is certified at targetRecall + reserve
+     * (default 0), while the gates and the promise stay at targetRecall. Spending recall slack at the
+     * edge made later periods break the promise more often in the lab (decision 2, 9 October).
+     */
+    reserve?: number;
+    /**
      * How the threshold is chosen. Default: the strongest guarantee the data supports - 'design' with
      * sampled calibration records, else 'auto' (conformal) with no heuristic fallback (a head the data
      * can't support fails its gates). 'heuristic' (no guarantee) only when set explicitly.

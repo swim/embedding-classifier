@@ -45,10 +45,12 @@ export function missingPolicyHeads<H extends string>(artifact: DecisionHeads<H>,
  * is a scoring bug or a corrupted artifact, not a negative. `dismissed`: heads a certified dismissal rule cleared for this message (rule-miner's
  * matcher.evaluate); they need no score, never fire and never suppress, as their training counted.
  */
-export function decide<H extends string>(artifact: DecisionHeads<H>, scores: Scores<H>, policy: DecisionPolicy<H>, dismissed: readonly H[] = [], fired: H | null = null): Decision<H> {
-  // `fired`: a certified firing rule matched this head ("rules or classifier"): it counts as at its threshold.
+export function decide<H extends string>(artifact: DecisionHeads<H>, scores: Scores<H>, policy: DecisionPolicy<H>, dismissed: readonly H[] = [], fired: H | readonly H[] | null = null): Decision<H> {
+  // `fired`: heads a certified rule (or an edge or middle tier) fired ("rules or classifier"): each counts
+  // as at its threshold, as certification counted it. One head or several.
+  const firedSet = new Set<H>(fired === null ? [] : typeof fired === 'string' ? [fired as H] : (fired as readonly H[]));
   const atLeast = (head: H, level: 'threshold' | 'review_floor') => {
-    if (head === fired && !dismissed.includes(head)) return true;
+    if (firedSet.has(head) && !dismissed.includes(head)) return true;
     const spec = artifact.heads[head];
     if (spec === undefined || dismissed.includes(head)) return false;
     const score = scores[head];
@@ -61,7 +63,7 @@ export function decide<H extends string>(artifact: DecisionHeads<H>, scores: Sco
     if (rule.when.some((h) => atLeast(h, 'review_floor'))) rule.heads.forEach((h) => suppressed.add(h));
   }
   for (const head of policy.priority) {
-    if (!suppressed.has(head) && atLeast(head, 'threshold')) return { head, reason: head === fired ? 'rule' : 'above_threshold' };
+    if (!suppressed.has(head) && atLeast(head, 'threshold')) return { head, reason: firedSet.has(head) ? 'rule' : 'above_threshold' };
   }
   if (policy.priority.some((h) => atLeast(h, 'review_floor'))) return { head: null, reason: 'near_threshold' };
   return { head: null, reason: 'none' };
@@ -70,32 +72,54 @@ export function decide<H extends string>(artifact: DecisionHeads<H>, scores: Sco
 /** What a rule set says about one message: rule-miner's `ruleSetMatcher(set).evaluate(text)`. */
 export interface RulesEvaluation {
   fired: { id: string; label: string } | null;
+  /** Every label a firing rule matched (rule-miner's `firing`); `fired` alone when absent. */
+  firing?: ReadonlyArray<{ id: string; label: string }>;
   dismissed: readonly string[];
 }
 
 export type Settlement<H extends string> =
   | { settled: true; decision: Decision<H> }
-  | { settled: false; forward: { fired: H | null; dismissed: H[] } };
+  | { settled: false; forward: { fired: H | null; firing: H[]; dismissed: H[] } };
 
 /**
  * The rules tier's decision, without the model: settled when the rules alone fix what `decide` would
- * return whatever the scores - every head the policy names is dismissed, or a firing rule's head
- * comes after only dismissed heads in priority and nothing undismissed can suppress it. Otherwise the
- * message goes to the model tier with what the rules found, for decide(artifact, scores, policy,
- * forward.dismissed, forward.fired). Both paths give the same decision (tested), so the guarantees
+ * return whatever the scores. Every fired head counts as at its threshold (and so at its review floor),
+ * a dismissed head as below both, and any other head as unknown. Walking the priority:
+ *   - a head that is dismissed, or certainly suppressed (some rule naming it has a fired `when` head),
+ *     can't win;
+ *   - a fired head that is certainly not suppressed (every `when` head of every rule naming it is
+ *     dismissed) wins;
+ *   - anything else (an unknown head, or a fired one whose suppression is unknown) needs the scores.
+ * When no head can win, a fired head in the priority means review ('near_threshold'), every head
+ * dismissed means none, and otherwise the scores decide. Otherwise the message goes to the model tier
+ * with what the rules found, for decide(artifact, scores, policy, forward.dismissed, forward.firing).
+ * Both paths give the same decision (tested exhaustively in @liquidau/router), so the guarantees
  * describe the system whichever path a message takes.
  */
 export function settleWithRules<H extends string>(policy: DecisionPolicy<H>, evaluation: RulesEvaluation): Settlement<H> {
   const named = new Set<H>([...policy.priority, ...(policy.suppress ?? []).flatMap((r) => [...r.when, ...r.heads])]);
   const dismissed = evaluation.dismissed.filter((h): h is H => named.has(h as H));
   const off = new Set<H>(dismissed);
-  const fired = evaluation.fired && named.has(evaluation.fired.label as H) && !off.has(evaluation.fired.label as H) ? (evaluation.fired.label as H) : null;
-  if (fired) {
-    const before = policy.priority.slice(0, Math.max(0, policy.priority.indexOf(fired)));
-    const canSuppress = (policy.suppress ?? []).some((r) => r.heads.includes(fired) && r.when.some((w) => !off.has(w)));
-    if (policy.priority.includes(fired) && before.every((h) => off.has(h)) && !canSuppress) return { settled: true, decision: { head: fired, reason: 'rule' } };
+  const labels = (evaluation.firing ?? (evaluation.fired ? [evaluation.fired] : [])).map((f) => f.label as H);
+  const firing = [...new Set(labels)].filter((h) => named.has(h) && !off.has(h));
+  const fired = evaluation.fired && firing.includes(evaluation.fired.label as H) ? (evaluation.fired.label as H) : firing[0] ?? null;
+  const on = new Set<H>(firing);
+  const forward = { settled: false as const, forward: { fired, firing, dismissed } };
+  /** 'yes': certainly suppressed; 'no': certainly not; 'maybe': the scores decide. */
+  const suppressed = (h: H): 'yes' | 'no' | 'maybe' => {
+    const rules = (policy.suppress ?? []).filter((r) => r.heads.includes(h));
+    if (rules.some((r) => r.when.some((w) => on.has(w)))) return 'yes';
+    return rules.every((r) => r.when.every((w) => off.has(w))) ? 'no' : 'maybe';
+  };
+  for (const h of policy.priority) {
+    if (off.has(h)) continue;
+    const s = suppressed(h);
+    if (s === 'yes') continue;
+    if (on.has(h) && s === 'no') return { settled: true, decision: { head: h, reason: 'rule' } };
+    return forward;
   }
+  if (policy.priority.some((h) => on.has(h))) return { settled: true, decision: { head: null, reason: 'near_threshold' } };
   if (policy.priority.every((h) => off.has(h))) return { settled: true, decision: { head: null, reason: 'none' } };
-  return { settled: false, forward: { fired, dismissed } };
+  return forward;
 }
 

@@ -46,11 +46,21 @@ test('settleWithRules: the shortcut cases, and messages that must go to the mode
   assert.deepEqual(settleWithRules(policy, { fired: null, dismissed: ['a', 'b'] }), { settled: true, decision: { head: null, reason: 'none' } });
   assert.deepEqual(settleWithRules(policy, { fired: { id: 'x', label: 'a' }, dismissed: [] }), { settled: true, decision: { head: 'a', reason: 'rule' } });
   // b fired, but a (not dismissed) comes first and could also suppress b: only the model can tell.
-  assert.deepEqual(settleWithRules(policy, { fired: { id: 'x', label: 'b' }, dismissed: [] }), { settled: false, forward: { fired: 'b', dismissed: [] } });
+  assert.deepEqual(settleWithRules(policy, { fired: { id: 'x', label: 'b' }, dismissed: [] }), { settled: false, forward: { fired: 'b', firing: ['b'], dismissed: [] } });
   // ...once a is dismissed, b's rule decides.
   assert.deepEqual(settleWithRules(policy, { fired: { id: 'x', label: 'b' }, dismissed: ['a'] }), { settled: true, decision: { head: 'b', reason: 'rule' } });
   // Only some heads dismissed: forwarded with them.
-  assert.deepEqual(settleWithRules(policy, { fired: null, dismissed: ['b', 'zzz'] }), { settled: false, forward: { fired: null, dismissed: ['b'] } });
+  assert.deepEqual(settleWithRules(policy, { fired: null, dismissed: ['b', 'zzz'] }), { settled: false, forward: { fired: null, firing: [], dismissed: ['b'] } });
+  // Several fired heads: each counts as at its threshold. a and b both fired: a wins (nothing can suppress it).
+  assert.deepEqual(settleWithRules(policy, { fired: { id: 'x', label: 'a' }, firing: [{ id: 'x', label: 'a' }, { id: 'y', label: 'b' }], dismissed: [] }), { settled: true, decision: { head: 'a', reason: 'rule' } });
+  // b outranks a, and a fired suppresses b for certain, so a wins without any score.
+  const flipped: DecisionPolicy<H> = { priority: ['b', 'a'], suppress: [{ when: ['a'], heads: ['b'] }] };
+  assert.deepEqual(settleWithRules(flipped, { fired: { id: 'y', label: 'b' }, firing: [{ id: 'y', label: 'b' }, { id: 'x', label: 'a' }], dismissed: [] }), { settled: true, decision: { head: 'a', reason: 'rule' } });
+  assert.deepEqual(decide(artifact, {}, flipped, [], ['b', 'a']), { head: 'a', reason: 'rule' }, 'decide agrees, with no scores needed');
+  // Every head that could win is suppressed by a fired head: review, whatever the scores.
+  const cycle: DecisionPolicy<H> = { priority: ['a', 'b'], suppress: [{ when: ['b'], heads: ['a'] }, { when: ['a'], heads: ['b'] }] };
+  assert.deepEqual(settleWithRules(cycle, { fired: { id: 'x', label: 'a' }, firing: [{ id: 'x', label: 'a' }, { id: 'y', label: 'b' }], dismissed: [] }), { settled: true, decision: { head: null, reason: 'near_threshold' } });
+  assert.deepEqual(decide(artifact, {}, cycle, [], ['a', 'b']), { head: null, reason: 'near_threshold' });
 });
 
 test('checkRuleSetPairing: heads certified with another rule set are named', () => {

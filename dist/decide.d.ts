@@ -39,13 +39,18 @@ export declare function missingPolicyHeads<H extends string>(artifact: DecisionH
  * is a scoring bug or a corrupted artifact, not a negative. `dismissed`: heads a certified dismissal rule cleared for this message (rule-miner's
  * matcher.evaluate); they need no score, never fire and never suppress, as their training counted.
  */
-export declare function decide<H extends string>(artifact: DecisionHeads<H>, scores: Scores<H>, policy: DecisionPolicy<H>, dismissed?: readonly H[], fired?: H | null): Decision<H>;
+export declare function decide<H extends string>(artifact: DecisionHeads<H>, scores: Scores<H>, policy: DecisionPolicy<H>, dismissed?: readonly H[], fired?: H | readonly H[] | null): Decision<H>;
 /** What a rule set says about one message: rule-miner's `ruleSetMatcher(set).evaluate(text)`. */
 export interface RulesEvaluation {
     fired: {
         id: string;
         label: string;
     } | null;
+    /** Every label a firing rule matched (rule-miner's `firing`); `fired` alone when absent. */
+    firing?: ReadonlyArray<{
+        id: string;
+        label: string;
+    }>;
     dismissed: readonly string[];
 }
 export type Settlement<H extends string> = {
@@ -55,15 +60,23 @@ export type Settlement<H extends string> = {
     settled: false;
     forward: {
         fired: H | null;
+        firing: H[];
         dismissed: H[];
     };
 };
 /**
  * The rules tier's decision, without the model: settled when the rules alone fix what `decide` would
- * return whatever the scores - every head the policy names is dismissed, or a firing rule's head
- * comes after only dismissed heads in priority and nothing undismissed can suppress it. Otherwise the
- * message goes to the model tier with what the rules found, for decide(artifact, scores, policy,
- * forward.dismissed, forward.fired). Both paths give the same decision (tested), so the guarantees
+ * return whatever the scores. Every fired head counts as at its threshold (and so at its review floor),
+ * a dismissed head as below both, and any other head as unknown. Walking the priority:
+ *   - a head that is dismissed, or certainly suppressed (some rule naming it has a fired `when` head),
+ *     can't win;
+ *   - a fired head that is certainly not suppressed (every `when` head of every rule naming it is
+ *     dismissed) wins;
+ *   - anything else (an unknown head, or a fired one whose suppression is unknown) needs the scores.
+ * When no head can win, a fired head in the priority means review ('near_threshold'), every head
+ * dismissed means none, and otherwise the scores decide. Otherwise the message goes to the model tier
+ * with what the rules found, for decide(artifact, scores, policy, forward.dismissed, forward.firing).
+ * Both paths give the same decision (tested exhaustively in @liquidau/router), so the guarantees
  * describe the system whichever path a message takes.
  */
 export declare function settleWithRules<H extends string>(policy: DecisionPolicy<H>, evaluation: RulesEvaluation): Settlement<H>;

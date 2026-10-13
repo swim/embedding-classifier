@@ -1,5 +1,8 @@
 import { type Guarantee } from './conformal.ts';
 import { type HeadFeatures, type ReferenceSet } from './heads.ts';
+import type { EdgeDocument } from './edge.ts';
+import { type FinerModel } from './finer.ts';
+import { type MiddleDocument } from './middle.ts';
 export type Calibration = {
     method: 'platt';
     a: number;
@@ -10,10 +13,10 @@ export type Calibration = {
     y: number[];
 };
 export interface HeadSpec {
-    /** One per embedding dimension, or per feature for knn (1) and stack (3) heads. */
+    /** One per embedding dimension, or per feature for knn (1) and stack (3) heads, or dimensions + 1 for a finer head. */
     weights: number[];
     bias: number;
-    /** knn and stack heads: how the embedding becomes the head's features (absent: linear on the embedding). */
+    /** knn, stack and finer heads: how the embedding becomes the head's features (absent: linear on the embedding). */
     features?: HeadFeatures;
     /**
      * Certified dismissal rules in front of this head (rule-miner): messages they clear count as misses
@@ -23,6 +26,21 @@ export interface HeadSpec {
         rule_set: string;
         max_rate: number;
         certified: number;
+    };
+    /**
+     * The edge model this head was certified with (trainEdge, trainHeads' HeadInput.edge): its fires
+     * counted as caught and its dismissals as misses. `model_sha256` is edgeHeadDigest of that model;
+     * the router refuses a release whose edge document runs another (checkEdgePairing).
+     */
+    edge?: {
+        model_sha256: string;
+    };
+    /**
+     * The middle tier this head was certified behind (middle.ts: middleHeadDigest of its model); the
+     * router refuses a release whose middle document runs another (checkTierPairing).
+     */
+    middle?: {
+        model_sha256: string;
     };
     calibration: Calibration;
     /** Act at or above this calibrated probability. */
@@ -63,7 +81,16 @@ export interface EmbeddingSpec {
     precision?: string;
     /** Characters kept per text before tokenising (`truncateText`); use the same value at runtime. */
     max_chars?: number;
+    /**
+     * Context features: the heads were trained on the message's embedding followed by its context's (for
+     * example the conversation's next turn, or an assistant's reply), each from its own encoder. This
+     * records the context's encoder; the heads' input width is `dimensions + context.dimensions`
+     * (featureWidth), and scoreEmbedding takes the two vectors concatenated, message first.
+     */
+    context?: Omit<EmbeddingSpec, 'context'>;
 }
+/** The width of the heads' input: the embedding's dimensions, plus its context's when the artifact has context features. */
+export declare function featureWidth(spec: Pick<EmbeddingSpec, 'dimensions' | 'context'>): number;
 /**
  * How a runtime's embedder differs from the one the artifact's heads were trained on (empty when they
  * match). Vectors of the right width can still mean something else - another layer set, precision or
@@ -97,6 +124,8 @@ export interface ClassifierArtifact<H extends string = string> {
     heads: Partial<Record<H, HeadSpec>>;
     /** Training embeddings shared by knn and stack heads (data derived from training messages). */
     reference?: ReferenceSet;
+    /** The finer-label model shared by finer heads (finer.ts; trainHeads' `finer` option). */
+    finer?: FinerModel;
     training?: Record<string, unknown>;
     evaluation?: Record<string, unknown>;
     gates?: GateResult;
@@ -116,6 +145,8 @@ export declare function validateArtifact<H extends string = string>(raw: unknown
     heads?: readonly H[];
     mode?: 'shadow' | 'enforce';
 }): ClassifierArtifact<H>;
+/** Throws unless `spec` is a usable embedding identity (its context, if any, is checked separately). */
+export declare function validateEmbeddingSpec(spec: Omit<EmbeddingSpec, 'context'>, what: string): void;
 /**
  * Builds the artifact's runtime scoring state now (decoded reference rows, stack heads' projected
  * rows) instead of on the first scoreEmbedding call, so a server pays it once at start-up. The state
@@ -130,3 +161,17 @@ export declare function scoreEmbedding<H extends string>(artifact: ClassifierArt
  * misses, so it doesn't describe the system: refuse to serve while this is non-empty.
  */
 export declare function checkRuleSetPairing<H extends string>(artifact: ClassifierArtifact<H>, ruleSet: string): string[];
+/**
+ * The edge and middle tiers a release runs against what each head was certified with: every certified
+ * edge or middle digest must equal the running document's head digest, a tier may decide only for heads
+ * certified with it, and a middle head's thresholds must have been certified behind the edge model the
+ * release runs. Empty when they pair.
+ */
+export declare function checkTierPairing<H extends string>(artifact: ClassifierArtifact<H>, edge: EdgeDocument | null, middle: MiddleDocument | null): string[];
+/**
+ * Heads whose certification doesn't match the edge the release runs (`edge`: the release's edge
+ * document, null without one): a head certified with an edge model needs exactly that model in the
+ * document (edgeHeadDigest), and a model the edge runs for a head needs the head certified with it.
+ * Refuse to serve while this is non-empty.
+ */
+export declare function checkEdgePairing<H extends string>(artifact: ClassifierArtifact<H>, edge: EdgeDocument | null): string[];

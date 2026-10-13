@@ -29,6 +29,10 @@ export function groupScores(scores, groups, pick) {
     scores.forEach((s, i) => by.set(groups[i], by.has(groups[i]) ? pick(by.get(groups[i]), s) : s));
     return [...by.values()];
 }
+/** A guarantee's chain record (Guarantee.chain) for `claims` earlier claims and `ladder` candidates tried. */
+export function guaranteeChain(delta, claims, ladder) {
+    return { claims, ladder, joint_delta: Math.min(1, ladder * (claims + 1) * delta) };
+}
 /**
  * Chooses a recall head's threshold under a conformal mode. The recall guarantee caps the
  * threshold from above, each false-alarm budget bounds it from below; if they cross, no threshold

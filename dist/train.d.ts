@@ -2,6 +2,8 @@ import { type DesignSummary } from './design.ts';
 import { type ExampleRecord, type ProvenanceCode, type ProvenanceOptions, type WeightCaps, type WeightCapSummary } from './records.ts';
 import { type ClassifierArtifact, type EmbeddingSpec, type HeadSpec, type RouterTraining } from './artifact.ts';
 import { type HeadEvaluation } from './evaluate.ts';
+import { type CascadeBudgets } from './middle.ts';
+import { type FinerModel } from './finer.ts';
 import { type HeadType, type ReferenceSet } from './heads.ts';
 import { type HeadPolicy } from './threshold.ts';
 export declare const SPLITS: readonly ["train", "calibration", "test"];
@@ -44,6 +46,28 @@ export interface HeadInput<H extends string> {
         certified: number;
     };
     /**
+     * The edge tier in front of this head (trainEdge's rows for it): edge-dismissed calibration, test
+     * and background rows score 0 and edge-fired ones 1, so the head's guarantee is certified jointly:
+     * a positive the edge dismissed is a miss, one it fired is caught, and its fires count against the
+     * firing budget. The calibrator is fitted on the rows the edge leaves to the head. `edgeSha256` is
+     * the head's edge model digest (trainEdge's rungs, edgeHeadDigest), recorded so the router can check
+     * the release runs the same model. A list is a ladder (edgeLadder): the first candidate with which the
+     * head passes its gates with a guarantee is kept (result.edgeChoice; assembleEdge builds the document).
+     */
+    edge?: EdgeInputRows | readonly EdgeInputRows[];
+    /**
+     * The middle tier behind the edge (middle.ts; lab stages CC and DY): chosen for this head from the
+     * training rows only, before calibration. The edge's, the middle's and this head's training-row
+     * scores re-derive every tier's thresholds on the training rows; the cascade is kept when its false
+     * alarms at target + reserve are at most 1.1 × edge → head's + 0.001 (chooseCascade). Kept: the head
+     * is certified jointly with `rows` (the edge's and the middle's decisions) and records
+     * `middle: { model_sha256 }`; otherwise with the edge alone. Recall heads behind a single edge
+     * candidate only (what the lab validated). cascadeInput builds this from trainEdge and trainMiddle.
+     * `choice` fixes the outcome instead (decide it before training: choosing after seeing the gates
+     * spends the guarantee's confidence twice).
+     */
+    cascade?: CascadeInput;
+    /**
      * Extra POSITIVES for the train split only, e.g. rule-miner's weakLabels(): embeddings with a
      * weight in [0, 1] each. They never reach calibration, test or the background budget, and an
      * embedding identical to a calibration, test or background row is refused as leakage.
@@ -55,6 +79,55 @@ export interface HeadInput<H extends string> {
      * share λ / (1 + λ) of the positive class's weight rather than adding to it.
      */
     maxWeakShare?: number;
+    /**
+     * Add the finer-label route score (finer.ts) to this head's features: the embedding plus
+     * scale · logit(Σ P(finer label | x) · route rate), certified like any head. Needs TrainInput.finer.
+     * The head is linear (type 'auto' stays linear; 'knn' and 'stack' are refused). Off by default:
+     * it pays where the route is a union of finer labels (lab stages SL and JC).
+     */
+    finer?: boolean | {
+        scale?: number;
+    };
+}
+export interface CascadeInput {
+    /** The edge's and the middle's decisions together (trainMiddle's heads[h].rows). */
+    rows: {
+        fired: readonly boolean[];
+        dismissed: readonly boolean[];
+        background?: {
+            fired: readonly boolean[];
+            dismissed: readonly boolean[];
+        };
+    };
+    /** middleHeadDigest of the head's middle model. */
+    middleSha256: string;
+    /** Training-row scores aligned with X (NaN off the training rows): the edge's out-of-fold blend, the middle's cross-fitted logit. */
+    scores: {
+        edge: readonly number[];
+        middle: readonly number[];
+    };
+    budgets: CascadeBudgets;
+    choice?: 'cascade' | 'edge';
+}
+/** A head's cascade decision (result.cascadeChoice, stored as artifact.training.cascade_choice). */
+export interface CascadeChoiceRecord {
+    cascade: boolean;
+    /** Training false alarms at target + reserve (absent when `choice` fixed the outcome). */
+    costs?: {
+        twoTier: number;
+        cascade: number;
+    };
+    forced?: true;
+    criterion: string;
+}
+export interface EdgeInputRows {
+    fired: readonly boolean[];
+    dismissed: readonly boolean[];
+    background?: {
+        fired: readonly boolean[];
+        dismissed: readonly boolean[];
+    };
+    edgeSha256: string;
 }
 export interface WeakInput {
     X: ReadonlyArray<ArrayLike<number>>;
@@ -90,6 +163,24 @@ export interface TrainInput<H extends string> {
     heads: ReadonlyArray<HeadInput<H>>;
     /** Inverse L2 strength (default 1). */
     C?: number;
+    /**
+     * Fit linear and finer heads on the embedding standardised per dimension (mean and sd over X and
+     * background.X: features only, no labels), with the standardisation folded into the stored weights,
+     * so the artifact and runtime are unchanged. It changes what the L2 penalty shrinks. With C = 0.01 it is
+     * the lab's "recipe" (stage JC), which helped on EmbeddingGemma and was mixed on mpnet: measure before
+     * adopting. Off by default. knn and stack heads are unaffected.
+     */
+    standardize?: boolean;
+    /**
+     * The finer label of each row of X (null where unknown), for heads with `finer`: one multinomial model
+     * over it, fitted on the training rows that carry one (out of fold for those rows) and stored as
+     * artifact.finer. C is its inverse L2 strength (default 0.01). Training rows the finer labels came
+     * from need no other label: rows labelled only with a finer label still fit the shared model.
+     */
+    finer?: {
+        labels: ReadonlyArray<string | null>;
+        C?: number;
+    };
     calibration?: 'platt' | 'isotonic';
     /** review_floor = threshold × reviewRatio (default 0.5). */
     reviewRatio?: number;
@@ -208,6 +299,12 @@ export interface TrainResult<H extends string> {
     }>>;
     /** Heads trained with type 'auto': each type's cross-validated cost and the choice - store as artifact.training.head_choice. */
     headChoice: Partial<Record<H, HeadChoice>>;
+    /** The finer-label model shared by finer heads - store as artifact.finer (buildArtifact does). */
+    finer?: FinerModel;
+    /** Heads trained with an edge: which candidate of their ladder was kept (0 for a single edge). */
+    edgeChoice?: Partial<Record<H, number>>;
+    /** Heads given HeadInput.cascade: whether the middle tier was kept, and why. */
+    cascadeChoice: Partial<Record<H, CascadeChoiceRecord>>;
     /** With sampled records: the designs and each head's estimator - store as artifact.training.design. */
     design?: {
         designs: DesignSummary[];
@@ -224,6 +321,10 @@ export interface HeadChoice {
     costs: Record<HeadType, number>;
     criterion: string;
 }
+/** The edge and dismissal rules decided every calibration row, leaving the head's calibrator nothing to fit. */
+export declare class CalibrationRemainderError extends Error {
+    name: string;
+}
 export declare function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<H>;
 /**
  * Serialises the artifact, re-loads it through validateArtifact and checks runtime scoring
@@ -232,7 +333,7 @@ export declare function trainHeads<H extends string>(input: TrainInput<H>): Trai
 export declare function assertRoundTrip<H extends string>(artifact: ClassifierArtifact<H>, X: ReadonlyArray<ArrayLike<number>>, testProbabilities: TrainResult<H>['testProbabilities'], sample?: number): void;
 /**
  * The artifact for a training result, with its gates taken from the result (passed exactly when no
- * gate failed), so they are never set by hand. Also records the reference, head choices, convergence,
+ * gate failed), so they are never set by hand. Also records the reference, the finer model, head choices, convergence,
  * provenance, design and weak-label summaries. Serve it through validateArtifact(raw, { mode }).
  */
 export declare function buildArtifact<H extends string>(result: TrainResult<H>, options: {

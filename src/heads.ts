@@ -23,6 +23,7 @@
  */
 import { decisionFunction, fitLogistic, seededRandom } from '@liquidau/solvers';
 
+import type { FinerFeatures } from './finer.ts';
 import type { HeadPolicy } from './threshold.ts';
 
 export type HeadType = 'linear' | 'knn' | 'stack';
@@ -33,7 +34,9 @@ const FOLDS = 3;
 
 export type HeadFeatures =
   | { kind: 'knn'; k: number }
-  | { kind: 'stack'; k: number; linear: { weights: number[]; bias: number }; pca: { mean: number[]; components: number[][] } };
+  | { kind: 'stack'; k: number; linear: { weights: number[]; bias: number }; pca: { mean: number[]; components: number[][] } }
+  /** The embedding plus the finer-label route score (finer.ts): scored with the artifact's finer model, not the reference. */
+  | FinerFeatures;
 
 /** The artifact's shared reference rows. */
 export interface ReferenceSet {
@@ -243,7 +246,7 @@ export function projectedRows(head: string, features: Extract<HeadFeatures, { ki
 }
 
 /** Features for one head at runtime; `sims` are the embedding's cosines to every reference row (computed once per message). */
-export function headFeatureVector(head: string, features: HeadFeatures, embedding: ArrayLike<number>, ref: RuntimeReference, sims: ArrayLike<number>): number[] {
+export function headFeatureVector(head: string, features: Exclude<HeadFeatures, { kind: 'finer' }>, embedding: ArrayLike<number>, ref: RuntimeReference, sims: ArrayLike<number>): number[] {
   const pos = ref.pos.get(head), neg = ref.neg.get(head);
   if (!pos || !neg) throw new Error(`head ${head} has no reference labels`);
   const knn = knnFeature(sims, pos, neg, features.k);

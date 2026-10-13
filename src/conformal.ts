@@ -57,6 +57,19 @@ export interface Guarantee {
   false_alarm?: number;
   /** Certified share of background text that may fire (from the background budget). */
   background_rate?: number;
+  /**
+   * Claims certified earlier on the same calibration sample, with this one chained to them: the dismissal
+   * rules (1), the edge's fire and dismiss thresholds (2), the middle tier's (2); and how many edge
+   * candidates were tried before this one was kept (`ladder`). `delta` holds for this threshold given
+   * the earlier ones; `joint_delta` = min(1, ladder · (claims + 1) · delta) bounds the probability that
+   * any of them fails (a union bound, assuming each claim at this delta).
+   */
+  chain?: { claims: number; ladder: number; joint_delta: number };
+}
+
+/** A guarantee's chain record (Guarantee.chain) for `claims` earlier claims and `ladder` candidates tried. */
+export function guaranteeChain(delta: number, claims: number, ladder: number): NonNullable<Guarantee['chain']> {
+  return { claims, ladder, joint_delta: Math.min(1, ladder * (claims + 1) * delta) };
 }
 
 export interface Sufficiency {

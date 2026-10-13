@@ -44,13 +44,24 @@ console.log(decide(artifact, scoreEmbedding(artifact, [2.1, 1.9]), { priority: [
 
 A two-head version with a rules baseline, slices and gates is in [docs/EXAMPLE.md](docs/EXAMPLE.md).
 
+When a route is a union of a finer label your labelling already records, such as intents under
+"needs a person", pass the finer labels to `trainHeads` and set `finer: true` on the head. It adds
+a certified finer-label route score to the embedding (off by default; see `finer` in
+[docs/API.md](docs/API.md)).
+
+With an expensive main encoder behind the edge, a cheaper encoder's head can fire and dismiss in
+between: `trainMiddle`, with `HeadInput.cascade`. Training keeps it per head only where the training
+rows say it costs no false alarms, and the head is certified behind both tiers. Off by default: it is
+much cheaper, but its heads fail the release gates more often (liquidau-lab stage DZ); see
+"Middle tier" in [docs/API.md](docs/API.md).
+
 ## Which threshold mode
 
 | Mode | Use when | Guarantee |
 |---|---|---|
 | `heuristic` | Exploring, low stakes (the default) | None |
 | `conformal-expected` | Recall heads, calibration not design-sampled | Recall on average |
-| `conformal-pac` | Recall heads, enough calibration positives | Recall with probability 1 − δ |
+| `conformal-pac` | Recall heads, enough calibration positives | Recall with probability 1 − δ (behind the edge or other tiers, 1 − `guarantee.chain.joint_delta` for the pipeline: docs/THRESHOLDS.md) |
 | `auto` | Recall heads, calibration not design-sampled | Strongest conformal guarantee the data supports |
 | `design` | Calibration came from `designSample` | Recall or precision, from the sample design |
 
@@ -61,7 +72,7 @@ A two-head version with a rules baseline, slices and gates is in [docs/EXAMPLE.m
 
 | Area | Exports |
 |---|---|
-| Training | `trainHeads`, `assertRoundTrip` |
+| Training | `trainHeads` (options `finer`, `standardize`, `cascade`), `assertRoundTrip` |
 | Thresholds | `pickThreshold`, `conformalThreshold`, `budgetThreshold` |
 | Evaluation, gates | `evaluateHead`, `gateHead`, `reportMarkdown` |
 | Runtime | `validateArtifact`, `scoreEmbedding`, `decide` |

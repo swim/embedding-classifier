@@ -5,9 +5,12 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { CachedEmbedder, hashEmbedding, truncateText } from '../src/embedder.ts';
+import { decisionFunction, fitPlattFirth, prevalenceWeights } from '@liquidau/solvers';
+
 import {
   assertRoundTrip,
   buildArtifact,
+  calibrate,
   evaluateHead,
   gateHead,
   pickThreshold,
@@ -15,6 +18,7 @@ import {
   reportMarkdown,
   trainHeads,
   validateArtifact,
+  type CalibrationRecord,
   type ClassifierArtifact,
   type HeadPolicy,
   type Split,
@@ -111,6 +115,47 @@ function dataset(n: number, seed = 1) {
   return { X, y, split };
 }
 
+test('the artifact records the calibrator and the calibration gate as chosen', () => {
+  const { X, y, split } = dataset(1600);
+  const result = trainHeads({
+    X, split, C: 1, calibration: 'platt', maxEce: 0.1, calibrationAlpha: 0.01, calibrationGate: 'region',
+    heads: [{ name: 'urgent', y, prevalence: 0.05, type: 'linear', policy: { ...recall, targetRecall: 0.9, designRecall: 0.95, minPositiveGroups: undefined } as HeadPolicy }],
+  });
+  assert.deepEqual(result.calibration, { method: 'platt', max_ece: 0.1, gate: { kind: 'region', alpha: 0.01, tolerance: 0.05 } });
+  const artifact = buildArtifact(result, { version: 'v1', createdAt: '', embedding: { model_id: 'test', dimensions: 8, normalize: false } });
+  assert.deepEqual(artifact.training?.calibration, result.calibration);
+});
+
+test("calibrationRefit 'pooled' refits on calibration ∪ test after the gates and moves no decision", () => {
+  const { X, y, split } = dataset(1600);
+  const base = { X, split, C: 1, heads: [{ name: 'urgent', y, prevalence: 0.05, type: 'linear' as const, policy: { ...recall, targetRecall: 0.9, designRecall: 0.95, minPositiveGroups: undefined } as HeadPolicy }] };
+  const plain = trainHeads(base);
+  const pooled = trainHeads({ ...base, calibrationRefit: 'pooled' });
+  const a = plain.heads.urgent!, b = pooled.heads.urgent!;
+  assert.deepEqual(b.weights, a.weights);
+  assert.notDeepEqual(b.calibration, a.calibration);
+  assert.equal(b.review_floor, b.threshold * 0.5);
+  // The pooled calibrator is Firth-Platt on calibration ∪ test, each half weighted as it was evaluated.
+  const z = X.map((x) => decisionFunction({ coef: a.weights, intercept: a.bias }, x));
+  const half = (s: Split) => { const idx = X.map((_, i) => i).filter((i) => split[i] === s); const ys = idx.map((i) => y[i]); return { z: idx.map((i) => z[i]), y: ys, w: prevalenceWeights(ys, 0.05) }; };
+  const cal = half('calibration'), test = half('test');
+  const hand = fitPlattFirth([...cal.z, ...test.z], [...cal.y, ...test.y], [...cal.w, ...test.w]);
+  assert.deepEqual(b.calibration, { method: 'platt', a: hand.a, c: hand.c });
+  // Every row keeps its decision; the gates and the test evaluation are the calibration-only fit's.
+  for (const v of z) assert.equal(calibrate(b.calibration, v) >= b.threshold, calibrate(a.calibration, v) >= a.threshold);
+  assert.deepEqual(pooled.evaluation, plain.evaluation);
+  assert.deepEqual(pooled.failures, plain.failures);
+  assert.ok(pooled.warnings.some((w) => /calibrationRefit 'pooled'.*no held-out check/.test(w)), pooled.warnings.join('; '));
+  // Recorded with the release, and what runs is what testProbabilities holds.
+  assert.equal(plain.calibration.refit, undefined);
+  assert.deepEqual(pooled.calibration, { ...plain.calibration, refit: 'pooled' });
+  const artifact = buildArtifact(pooled, { version: 'v1', createdAt: '', embedding: { model_id: 'test', dimensions: 8, normalize: false } });
+  assertRoundTrip(artifact, X, pooled.testProbabilities);
+  assert.equal((validateArtifact(JSON.parse(JSON.stringify(artifact))).training?.calibration as CalibrationRecord | undefined)?.refit, 'pooled');
+  assert.throws(() => trainHeads({ ...base, calibration: 'isotonic', calibrationRefit: 'pooled' }), /isotonic/);
+  assert.throws(() => trainHeads({ ...base, calibrationRefit: 'both' as never }), /calibrationRefit must be/);
+});
+
 test('trainHeads end to end: fits, gates, and the serialised artifact scores identically', () => {
   const { X, y, split } = dataset(2400);
   const lines: string[] = [];
@@ -139,9 +184,14 @@ test('trainHeads end to end: fits, gates, and the serialised artifact scores ide
   const paired = buildArtifact(result, { version: 'v1', createdAt: '', embedding: artifact.embedding, router: { ruleSetHash: 'f'.repeat(64) } });
   assert.deepEqual(validateArtifact(JSON.parse(JSON.stringify(paired))).training?.router, { ruleSetHash: 'f'.repeat(64) });
   assert.throws(() => buildArtifact(result, { version: 'v1', embedding: artifact.embedding, router: { ruleSetHash: 'nope' } }), /ruleSetHash/);
+  // The calibration choices, defaults resolved, travel with the release (a head's own method says only 'platt').
+  assert.deepEqual(validateArtifact(JSON.parse(JSON.stringify(artifact))).training?.calibration, { method: 'platt-firth', max_ece: 0.05, gate: null });
+  assert.equal(artifact.heads.urgent!.calibration.method, 'platt');
   const report = reportMarkdown(artifact, { title: 'Test model', baselineName: 'rules' });
   assert.match(report, /^# Test model/);
   assert.match(report, /## urgent/);
+  // A Platt calibrator's own share of the decision-region error is printed beside the total.
+  assert.match(report, /calibration at the decisions: .*\(±\d\.\d{3}; calibrator ±\d\.\d{3}\)/);
 });
 
 test('trainHeads refuses a split without both classes', () => {
@@ -164,6 +214,7 @@ test('trainHeads with isotonic calibration round-trips and records the shipped t
   const { X, y, split } = dataset(1200);
   const result = trainHeads({ X, split, calibration: 'isotonic', heads: [{ name: 'h', y, prevalence: 0.05, policy: { kind: 'recall', targetRecall: 0.8, designRecall: 0.9, minPositives: 30 } }] });
   assert.equal(result.heads.h!.calibration.method, 'isotonic');
+  assert.equal(result.evaluation.h!.calibration_region?.regions[0]?.se_calibrator, undefined, 'isotonic has no calibrator covariance to report');
   assert.equal(result.evaluation.h!.threshold, result.heads.h!.threshold);
   const artifact: ClassifierArtifact<'h'> = { version: 'v', created_at: '', embedding: { model_id: 't', dimensions: 8, normalize: false }, heads: result.heads };
   assertRoundTrip(artifact, X, result.testProbabilities);

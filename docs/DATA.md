@@ -34,6 +34,25 @@ finer-label score helped nothing once the head already had the finer-label score
 those strata cost ABCD `refund` its guarantees, so it is not recommended there (RESEARCH.md, stage SD
 and "Adoption re-check").
 
+**Reviewer errors.** The guarantees assume the labels are correct. In the lab (stage MC, 14 October),
+5% of labels were flipped (at random, or on the hardest cases) and 10% on the hardest cases.
+- **No promise failed silently.** Every head that kept its guarantee also kept its promise.
+- **The cost was refused guarantees.** A mislabelled positive scores like a negative, so reaching the
+  recall target means firing on too much traffic, and the gates refuse the head. A rare, cleanly
+  separated head lost every guarantee at 5% errors.
+- **Where a guarantee survived, false alarms rose** by about 2.5 to 3 points.
+- **Raising the target to allow for the error rate (T / (1 − ε)) made both worse,** so the library does
+  not do it.
+- **If many heads are refused for no clear reason, check label quality first.**
+
+**Prevalence after release.** A recall promise doesn't depend on prevalence; a precision promise does.
+When positives become rarer, the same false alarms make up a larger share of what fires. A head's new
+prevalence can be estimated from its firing rate and its test-split confusion matrix (black-box shift
+estimation; the examples' `ops-check` shows it). That holds only under label shift: the mix of
+positives changed, not how they look. On a real later period where the messages themselves changed,
+the estimate was biased (its interval covered the truth 2 times in 20), which is why it is not a
+library export.
+
 ## Training data
 
 | Export | What |

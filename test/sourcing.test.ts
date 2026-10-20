@@ -598,3 +598,68 @@ test("designSample: Neyman allocation follows N_h·√(p_h(1 − p_h)) within fl
   assert.throws(() => designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 1600, method: 'neyman', prior: Object.fromEntries(strata.map((h) => [h, 1])) }, scoringModel: 'm', seed: 1 }), /strictly between 0 and 1 in at least one stratum/);
   assert.throws(() => designSample({ frame, scoreBands: [0.95, 0.8], allocation: { total: 20, method: 'neyman', prior }, scoringModel: 'm', seed: 1 }), /below the \d+ that minPerStratum 30 needs/);
 });
+
+test('calibration: platt-firth is served as Platt, and the decision-region check is reported', () => {
+  const { records } = label(design(7, 3000).records);
+  const X = records.map((r) => byId.get(r.id)!.x);
+  const split = records.map((r) => r.role as Split);
+  const y = records.map((r) => r.labels.h as 0 | 1);
+  const run = (calibration: 'platt' | 'platt-firth') => trainHeads({ X, split, records, seed: 1, calibration, heads: [{ name: 'h', y, policy: { kind: 'precision', targetPrecision: 0.7, mode: 'design' } }] });
+  const platt = run('platt'), firth = run('platt-firth');
+  const cal = firth.heads.h!.calibration;
+  assert.equal(cal.method, 'platt');
+  // This fixture's calibration split is nearly separated (3 of 48 positives below the top negative), where
+  // Platt's slope is biased upward and Firth pulls it in: 2.31 against 1.61.
+  assert.ok(cal.method === 'platt' && platt.heads.h!.calibration.method === 'platt' && cal.a > 0 && cal.a < platt.heads.h!.calibration.a, `Firth a ${cal.method === 'platt' ? cal.a : ''} vs Platt ${JSON.stringify(platt.heads.h!.calibration)}`);
+  const region = firth.evaluation.h!.calibration_region!;
+  assert.ok(['pass', 'warn', 'fail'].includes(region.verdict));
+  assert.ok(region.regions.some((r) => r.region === 'review') && region.regions.every((r) => r.se > 0 && Number.isFinite(r.se)));
+});
+
+test('calibration gate: the region gate fails probabilities that are wrong where decisions are made, and replaces Cox', async () => {
+  const { evaluateHead, gateHead } = await import('../src/index.ts');
+  const policy = { kind: 'precision' as const, targetPrecision: 0.01 };
+  // 3,000 rows at 0.05 (5% positive) and 600 at 0.8 of which half are positive: 30 points off at the decisions.
+  const p = [...Array(3000).fill(0.05), ...Array(600).fill(0.8)];
+  const y = p.map((v, i) => (v < 0.5 ? (i % 20 === 0 ? 1 : 0) : i % 2));
+  const ev = evaluateHead({ p, y, w: p.map(() => 1), threshold: 0.5, calibrationRegion: { floor: 0.25 } });
+  assert.equal(ev.calibration_region!.verdict, 'fail');
+  const g = gateHead(policy, ev, { maxEce: 1, calibrationAlpha: 0.01, calibrationGate: 'region' });
+  assert.ok(g.failures.some((f) => /miscalibrated where decisions are made/.test(f)), g.failures.join('; '));
+  assert.ok(!g.failures.some((f) => /Cox/.test(f)), 'the region gate replaces Cox');
+  // Calibrated at the decisions: no failure.
+  const ok = evaluateHead({ p, y: p.map((v, i) => (v < 0.5 ? (i % 20 === 0 ? 1 : 0) : i % 5 === 0 ? 0 : 1)), w: p.map(() => 1), threshold: 0.5, calibrationRegion: { floor: 0.25 } });
+  assert.ok(!gateHead(policy, ok, { maxEce: 1, calibrationAlpha: 0.01, calibrationGate: 'region' }).failures.some((f) => /miscalibrated/.test(f)));
+});
+
+test('calibration gate: cox-corrected (the default) counts the calibrator\'s error, is reported through training, and falls back to plain Cox for isotonic', async () => {
+  const { evaluateHead, gateHead } = await import('../src/index.ts');
+  const { fitPlattFirth, plattCovariance } = await import('@liquidau/solvers');
+  const rand = seededRandom(9);
+  const sig = (x: number) => 1 / (1 + Math.exp(-x));
+  const draw = (n: number, slope: number) => { const z = Array.from({ length: n }, () => 4 * rand() - 3.5); return { z, y: z.map((v) => (rand() < sig(slope * v) ? 1 : 0)) }; };
+  const policy = { kind: 'precision' as const, targetPrecision: 0.01 };
+  const evaluate = (testSlope: number) => {
+    const cal = draw(700, 1.5), test = draw(700, testSlope);
+    const f = fitPlattFirth(cal.z, cal.y);
+    const p = test.z.map((v) => sig(f.a * v + f.c));
+    return evaluateHead({ p, y: test.y, w: p.map(() => 1), threshold: 0.5, calibrator: { a: f.a, c: f.c, method: 'platt-firth', logits: test.z, covariance: plattCovariance(f, cal.z) } });
+  };
+  // A test sample whose curve really differs from the calibrator's fails; one from the same curve passes.
+  const off = evaluate(0.6), same = evaluate(1.5);
+  assert.ok(off.calibration_test!.corrected!.applied && same.calibration_test!.corrected!.applied);
+  assert.ok(gateHead(policy, off, { maxEce: 1, calibrationAlpha: 0.01, calibrationGate: 'cox-corrected' }).failures.some((f) => /corrected for the calibrator's error/.test(f)));
+  assert.ok(!gateHead(policy, same, { maxEce: 1, calibrationAlpha: 0.01, calibrationGate: 'cox-corrected' }).failures.some((f) => /miscalibrated/.test(f)));
+  // The default gate is the corrected one.
+  assert.ok(gateHead(policy, off, { maxEce: 1, calibrationAlpha: 0.01 }).failures.some((f) => /corrected for the calibrator's error/.test(f)));
+  // Through training: reported for Platt and Firth, absent for isotonic (the gate then warns).
+  const { records } = label(design(7, 3000).records);
+  const X = records.map((r) => byId.get(r.id)!.x);
+  const split = records.map((r) => r.role as Split);
+  const y = records.map((r) => r.labels.h as 0 | 1);
+  const run = (calibration: 'platt-firth' | 'isotonic') => trainHeads({ X, split, records, seed: 1, calibration, calibrationAlpha: 0.01, calibrationGate: 'cox-corrected', heads: [{ name: 'h', y, policy: { kind: 'precision', targetPrecision: 0.7, mode: 'design' } }] });
+  const firth = run('platt-firth'), iso = run('isotonic');
+  assert.ok(firth.evaluation.h!.calibration_test!.corrected && Number.isFinite(firth.evaluation.h!.calibration_test!.corrected.wald));
+  assert.equal(iso.evaluation.h!.calibration_test!.corrected, undefined);
+  assert.ok(iso.warnings.some((w) => /level not corrected/.test(w)), iso.warnings.join('; '));
+});

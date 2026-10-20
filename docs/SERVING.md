@@ -24,7 +24,9 @@ How to run a trained artifact in production, including on serverless and edge ru
    package root.
 4. **Scoring and decision:** `scoreEmbedding`, then `decide`.
 5. **Logging:** record the scores for drift checks (`monitorWindow`, run on a schedule over logged
-   windows).
+   windows). Behind @liquidau/router, use its `checkWindow` instead. It runs `monitorWindow` per head
+   and also checks the rates the scores never see: the share the rules and the edge settle, and the
+   edge's fires and dismissals per label.
 
 **Skipping the embedding when a rule decides.** Under a "rules or classifier" policy, a certified
 rule's hit counts as its head firing. Apply it by lifting that head's score to its threshold before

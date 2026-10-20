@@ -71,8 +71,13 @@ test('trainHeads with the edge: joint certification, the edge record, pairing an
   const test = w.split.map((s, i) => (s === 'test' ? i : -1)).filter((i) => i >= 0 && w.y[i] === 1);
   const dismissed = test.filter((i) => rows.dismissed[i]).length / test.length;
   assert.ok(joint.evaluation.h!.recall <= 1 - dismissed + 1e-12);
-  // The head compensates for edge dismissals with a lower threshold than alone (or equal).
-  assert.ok(spec.threshold <= alone.heads.h!.threshold + 1e-12);
+  // The head compensates for edge dismissals with a lower threshold than alone (or equal) - when it has
+  // calibration positives left to place one. Here the edge settles every calibration positive, so the joint
+  // calibrator fits negatives only and the comparison is undefined (under plain Platt both thresholds
+  // used to saturate to 1.0, which hid this; Firth keeps the lone head's finite).
+  const remainderPositives = w.split.filter((s, i) => s === 'calibration' && w.y[i] === 1 && !rows.fired[i] && !rows.dismissed[i]).length;
+  if (remainderPositives > 0) assert.ok(spec.threshold <= alone.heads.h!.threshold + 1e-12);
+  else assert.equal(remainderPositives, 0, 'fixture: the edge settles every calibration positive');
   // Rows the edge decided are left out of the round-trip probabilities (never scored at runtime).
   assert.ok(joint.testProbabilities.h!.idx.every((i) => !rows.fired[i] && !rows.dismissed[i]));
   const artifact: ClassifierArtifact<'h'> = { version: 'v1', created_at: '', embedding: { model_id: 't', dimensions: 6, normalize: false }, heads: joint.heads };

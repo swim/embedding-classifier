@@ -14,7 +14,7 @@
  * already reproduces production prevalence, so `prevalence` must not be passed), and the test
  * metrics become design-based estimates. The `design` threshold mode then applies.
  */
-import { clopperPearsonUpper, conformalLowerThreshold, conformalRank, decisionFunction, designPrecisionThreshold, designRiskThreshold, fitIsotonic, fitLogistic, fitPlatt, minimumSamples, nextUp, prevalenceWeights, sigmoid } from '@liquidau/solvers';
+import { clopperPearsonUpper, conformalLowerThreshold, conformalRank, decisionFunction, designPrecisionThreshold, designRiskThreshold, fitIsotonic, fitLogistic, fitPlatt, fitPlattFirth, minimumSamples, plattCovariance, nextUp, prevalenceWeights, sigmoid } from '@liquidau/solvers';
 
 import { designOf, type DesignSummary } from './design.ts';
 import { capTrainingWeights, validateProvenance, type ExampleRecord, type ProvenanceCode, type ProvenanceOptions, type WeightCaps, type WeightCapSummary } from './records.ts';
@@ -176,7 +176,12 @@ export interface TrainInput<H extends string> {
    * from need no other label: rows labelled only with a finer label still fit the shared model.
    */
   finer?: { labels: ReadonlyArray<string | null>; C?: number };
-  calibration?: 'platt' | 'isotonic';
+  /**
+   * The calibrator: Platt with Firth's bias reduction ('platt-firth', the default since stage CG: finite
+   * when the calibration scores separate the classes, where plain Platt's slope runs off; stored and
+   * served as Platt), plain Platt ('platt', the default before), or isotonic.
+   */
+  calibration?: 'platt' | 'platt-firth' | 'isotonic';
   /** review_floor = threshold × reviewRatio (default 0.5). */
   reviewRatio?: number;
   /**
@@ -189,9 +194,37 @@ export interface TrainInput<H extends string> {
   /**
    * Fail a head whose test-split probabilities Cox's recalibration test rejects at this level (default
    * off). Prefer it to maxEce for rare classes: in simulation the ECE > 0.05 gate never fired at 2%
-   * prevalence, even for badly miscalibrated probabilities.
+   * prevalence, even for badly miscalibrated probabilities. What it checks is narrow: whether the test
+   * split's logistic recalibration matches the calibrator. It cannot see the curve's shape, so
+   * probabilities that are wrong in the tail pass it as often as right ones.
    */
   calibrationAlpha?: number;
+  /**
+   * Which calibration gate calibrationAlpha applies: 'cox-corrected' (default since stage CK), Cox's
+   * recalibration test with the Platt calibrator's own sampling error counted (for isotonic calibration,
+   * plain Cox with a warning; not applied, with a warning, when a fit's covariance is singular); 'cox',
+   * the plain test, which treats the fitted calibrator as exact and so refuses about 10% of correctly
+   * calibrated heads at α = 0.01 - but also catches more heads whose calibrator is badly off by its own
+   * sampling error, which the corrected test forgives as noise; or 'region' (stage
+   * CG), the decision-region gate: fail when the observed rate and the mean probability differ by
+   * demonstrably more than calibrationTolerance (default 0.05) at or above the review floor or in the top
+   * decile of scores, counting the Platt calibrator's own sampling error.
+   */
+  calibrationGate?: 'cox' | 'cox-corrected' | 'region';
+  calibrationTolerance?: number;
+  /**
+   * 'pooled' (opt-in; default 'none'): after the gates, refit each head's Platt calibrator on the calibration
+   * and test splits together (each weighted as it was evaluated: 1/π with sampled records), and carry the
+   * threshold over by rank, so every decision is unchanged and only the probabilities move. The gates, the
+   * test evaluation and every threshold are still computed with the calibration-only fit; the shipped
+   * probabilities therefore have no held-out check of their own (a warning says so). Lab stage CP2: on 140
+   * heads the pooled probabilities were closer to the truth in the decision regions (−0.80 points; heads 5
+   * points or more off fell from 23 to 8; in simulation the chance of a large error roughly halved), with the
+   * best-calibrated head (ToxicChat jailbreak) slightly worse. Lab stage FX checked it on the frame rows outside
+   * the labelled sample (90 cases, fresh seeds): −0.62 points, cases 5 points or more off 22 → 17. A run still
+   * has no held-out check of its own. Platt calibrators only.
+   */
+  calibrationRefit?: 'none' | 'pooled';
   groups?: readonly string[];
   slices?: Readonly<Record<string, readonly string[]>>;
   /**
@@ -287,6 +320,23 @@ export interface TrainResult<H extends string> {
   cascadeChoice: Partial<Record<H, CascadeChoiceRecord>>;
   /** With sampled records: the designs and each head's estimator - store as artifact.training.design. */
   design?: { designs: DesignSummary[]; heads: Record<string, { calibration: 'design-weighted'; threshold: string; evaluation: 'design-linearised' }> };
+  /** How the heads were calibrated and gated - store as artifact.training.calibration (buildArtifact does). */
+  calibration: CalibrationRecord;
+}
+
+/**
+ * The calibration choices a training run made, defaults resolved: the calibrator, and the calibration gates
+ * applied (the ECE bound; the calibration test when calibrationAlpha was given). A head's own
+ * `calibration.method` says only how it is served ('platt' covers both Platt fits), so a release records
+ * the fit here, to show whether a stored result is comparable with a later library's defaults.
+ */
+export interface CalibrationRecord {
+  method: 'platt' | 'platt-firth' | 'isotonic';
+  max_ece: number;
+  /** The calibration test, or null when calibrationAlpha was not given. */
+  gate: { kind: 'cox' | 'cox-corrected' | 'region'; alpha: number; tolerance?: number } | null;
+  /** Present when calibrationRefit 'pooled' was chosen: the shipped calibrators were refitted on calibration ∪ test after the gates. */
+  refit?: 'pooled';
 }
 
 export interface HeadChoice {
@@ -319,7 +369,7 @@ function indicesBySplit(split: readonly Split[], y: ReadonlyArray<0 | 1 | null>)
 }
 
 export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<H> {
-  const { X, split, C = 1, autoMargin = 0.2, requireConvergence = false, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, groups, slices, background, records, seed = 0, log = () => {} } = input;
+  const { X, split, C = 1, autoMargin = 0.2, requireConvergence = false, calibration: method = 'platt-firth', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, calibrationGate, calibrationTolerance, calibrationRefit = 'none', groups, slices, background, records, seed = 0, log = () => {} } = input;
   checkLength('split', split, X.length);
   split.forEach((s, i) => {
     if (!(SPLITS as readonly string[]).includes(s)) throw new Error(`split[${i}] is "${s}", expected one of ${SPLITS.join(', ')}`);
@@ -330,7 +380,13 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
   if (!(reviewRatio >= 0 && reviewRatio <= 1)) throw new Error('reviewRatio must be between 0 and 1');
   if (!(autoMargin >= 0 && autoMargin < 1)) throw new Error('autoMargin must be in [0, 1)');
   if (reviewEpsilon !== undefined && !(reviewEpsilon > 0 && reviewEpsilon < 1)) throw new Error('reviewEpsilon must be strictly between 0 and 1');
-  const result: TrainResult<H> = { heads: {}, evaluation: {}, failures: [], warnings: [], testProbabilities: {}, weakLabels: {}, headChoice: {}, convergence: {}, cascadeChoice: {} };
+  const gateKind = calibrationGate ?? 'cox-corrected';
+  if (calibrationRefit !== 'none' && calibrationRefit !== 'pooled') throw new Error(`calibrationRefit must be 'none' or 'pooled', got ${String(calibrationRefit)}`);
+  if (calibrationRefit === 'pooled' && method === 'isotonic') throw new Error("calibrationRefit 'pooled' refits a Platt calibrator; calibration 'isotonic' has none");
+  const result: TrainResult<H> = {
+    heads: {}, evaluation: {}, failures: [], warnings: [], testProbabilities: {}, weakLabels: {}, headChoice: {}, convergence: {}, cascadeChoice: {},
+    calibration: { method, max_ece: maxEce ?? 0.05, gate: calibrationAlpha === undefined ? null : { kind: gateKind, alpha: calibrationAlpha, ...(gateKind === 'region' ? { tolerance: calibrationTolerance ?? 0.05 } : {}) }, ...(calibrationRefit === 'pooled' ? { refit: 'pooled' as const } : {}) },
+  };
   checkLength('foldKeys', input.foldKeys, X.length);
   const foldKey = (i: number) => input.foldKeys?.[i] ?? groups?.[i] ?? `#${i}`;
 
@@ -613,10 +669,12 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
     }
     let calibrationConverged = true;
     let calibration: Calibration;
-    if (method === 'platt') {
-      const { a, c, converged } = fitPlatt(keep(calLogits), keep(yCal), keep(wCal));
+    let calibrationCovariance: ReturnType<typeof plattCovariance> = null;
+    if (method === 'platt' || method === 'platt-firth') {
+      const { a, c, converged } = (method === 'platt' ? fitPlatt : fitPlattFirth)(keep(calLogits), keep(yCal), keep(wCal));
       calibration = { method: 'platt', a, c };
       calibrationConverged = converged;
+      calibrationCovariance = plattCovariance(calibration, keep(calLogits), keep(wCal));
     } else calibration = { method: 'isotonic', ...fitIsotonic(keep(calLogits).map(sigmoid), keep(yCal), keep(wCal), { yMin: 0, yMax: 1 }) };
     // Convergence: a fit that stopped short of its tolerance is reported (a failure with requireConvergence).
     const modelConverged = model.converged && (fitted?.converged ?? true);
@@ -791,7 +849,8 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
     const reviewFloor = reviewEpsilon === undefined ? threshold * reviewRatio : Math.min(threshold, conformalLowerThreshold(positives, reviewEpsilon) ?? 0);
 
     const yTest = ySplit('test');
-    const pTest = idx.test.map((i) => preset(i) ?? calibrate(calibration, decisionFunction(model, rowFeatures(i))));
+    const zTest = idx.test.map((i) => (preset(i) === null ? decisionFunction(model, rowFeatures(i)) : 0));
+    const pTest = idx.test.map((i, j) => preset(i) ?? calibrate(calibration, zTest[j]));
     const atTest = <T>(values: readonly T[]) => idx.test.map((i) => values[i]);
     const testDesign = records ? designOf(idx.test.map((i) => records[i])) : null;
     const ev = evaluateHead({
@@ -806,6 +865,8 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
       delta,
       prevalence,
       ...(dismissal || edge ? { scored: idx.test.map((i) => preset(i) === null) } : {}),
+      calibrationRegion: { floor: reviewFloor, tolerance: calibrationTolerance, alpha: calibrationAlpha, ...(calibration.method === 'platt' ? { logits: zTest, covariance: calibrationCovariance } : {}) },
+      ...(calibration.method === 'platt' && method !== 'isotonic' ? { calibrator: { a: calibration.a, c: calibration.c, method, logits: zTest, covariance: calibrationCovariance } } : {}),
     });
     if (guarantee) ev.guarantee = guarantee;
     if (sufficiency) ev.sufficiency = sufficiency;
@@ -813,19 +874,42 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
       ev.background_rate = backgroundP.filter((p) => p >= threshold).length / backgroundP.length;
       ev.background_rate_upper = backgroundUpper(backgroundP, threshold, backgroundRanks, 1 - delta / 2);
     }
-    const gates = gateHead(policy, ev, { maxEce, calibrationAlpha });
+    const gates = gateHead(policy, ev, { maxEce, calibrationAlpha, calibrationGate, calibrationTolerance });
     sink.evaluation[name] = ev;
     sink.failures.push(...gates.failures.map((f) => `${name}: ${f}`));
     sink.warnings.push(...gates.warnings.map((w) => `${name}: ${w}`));
+    // calibrationRefit 'pooled': everything above (thresholds, evaluation, gates) used the calibration-only
+    // fit. Refit on calibration ∪ test and carry each threshold over by rank, so decisions don't change.
+    let shipped = { calibration, threshold, reviewFloor, pTest };
+    if (calibrationRefit === 'pooled' && calibration.method === 'platt') {
+      const scoredTest = idx.test.map((i) => preset(i) === null);
+      const onTest = <T>(v: readonly T[]) => v.filter((_, j) => scoredTest[j]);
+      const wTest = testDesign ? testDesign.inclusionProbs.map((p) => 1 / p) : prevalenceWeights(yTest, prevalence!);
+      const zs = [...keep(calLogits), ...onTest(zTest)];
+      const fit = (method === 'platt' ? fitPlatt : fitPlattFirth)(zs, [...keptY, ...onTest(yTest)], [...keep(wCal), ...onTest(wTest)]);
+      if (!(fit.a > 0)) {
+        sink.warnings.push(`${name}: calibrationRefit 'pooled': the pooled fit's slope ${fit.a} is not positive, so the calibration-only calibrator ships`);
+      } else {
+        const pooled: Calibration = { method: 'platt', a: fit.a, c: fit.c };
+        const carry = (t: number) => (t > 0 && t <= 1 ? calibrate(pooled, logitAt(calibration, t)) : t);
+        const t1 = carry(threshold);
+        const floor1 = reviewEpsilon === undefined ? t1 * reviewRatio : Math.min(t1, carry(reviewFloor));
+        // Decisions are unchanged by construction, up to rounding exactly at the threshold: count any.
+        let moved = 0;
+        for (const z of zs) if ((calibrate(calibration, z) >= threshold) !== (calibrate(pooled, z) >= t1)) moved++;
+        shipped = { calibration: pooled, threshold: t1, reviewFloor: floor1, pTest: idx.test.map((i, j) => preset(i) ?? calibrate(pooled, zTest[j])) };
+        sink.warnings.push(`${name}: calibrationRefit 'pooled': the shipped calibrator was refitted on calibration ∪ test (${zs.length} rows) after the gates; the gates and the test evaluation used the calibration-only fit, so the shipped probabilities have no held-out check${fit.converged ? '' : ' (the pooled fit did not converge)'}${moved ? `; ${moved} labelled row(s) at the threshold changed side by rounding` : ''}`);
+      }
+    }
     sink.heads[name] = {
-      weights: model.coef, bias: model.intercept, ...(fitted?.features ? { features: fitted.features } : {}), calibration, threshold, review_floor: reviewFloor,
+      weights: model.coef, bias: model.intercept, ...(fitted?.features ? { features: fitted.features } : {}), calibration: shipped.calibration, threshold: shipped.threshold, review_floor: shipped.reviewFloor,
       ...(dismissal ? { dismissal: { rule_set: dismissal.ruleSet, max_rate: dismissal.maxRate, certified: dismissal.certified } } : {}),
       ...(edge ? { edge: { model_sha256: edge.edgeSha256 } } : {}),
       ...(middleSha256 ? { middle: { model_sha256: middleSha256 } } : {}),
       ...(guarantee ? { guarantee: chained(guarantee) } : {}), ...(reviewEpsilon !== undefined ? { review_epsilon: reviewEpsilon } : {}),
     };
     // Round-trip checks score embeddings, so rows decided before the head (never scored at runtime) are left out.
-    sink.testProbabilities[name] = { idx: idx.test.filter((i) => preset(i) === null), p: pTest.filter((_, j) => preset(idx.test[j]) === null) };
+    sink.testProbabilities[name] = { idx: idx.test.filter((i) => preset(i) === null), p: shipped.pTest.filter((_, j) => preset(idx.test[j]) === null) };
   };
   result.edgeChoice = {};
   for (const headIn of input.heads) {
@@ -870,6 +954,23 @@ export function trainHeads<H extends string>(input: TrainInput<H>): TrainResult<
     if (using.length) result.reference = { ...reference.set, labels: Object.fromEntries(using.map((h) => [h, reference!.set.labels[h]])) };
   }
   return result;
+}
+
+/**
+ * The smallest double z at which a Platt calibrator reaches t (0 < t ≤ 1, slope > 0): a threshold's place
+ * on the logit scale, found by bisection so that calibrate(calibration, z) >= t holds exactly from z up.
+ */
+function logitAt(calibration: Calibration & { method: 'platt' }, t: number): number {
+  const at = (z: number) => calibrate(calibration, z) >= t;
+  const guess = t < 1 ? (Math.log(t / (1 - t)) - calibration.c) / calibration.a : (40 - calibration.c) / calibration.a;
+  let step = 1, lo = guess - step, hi = guess + step;
+  while (at(lo)) { step *= 2; lo = guess - step; }
+  while (!at(hi)) { step *= 2; hi = guess + step; }
+  for (;;) {
+    const mid = lo + (hi - lo) / 2;
+    if (mid <= lo || mid >= hi) return hi;
+    if (at(mid)) hi = mid; else lo = mid;
+  }
 }
 
 /**
@@ -932,6 +1033,7 @@ export function buildArtifact<H extends string>(
   if (Object.keys(result.weakLabels).length) training.weak_labels = result.weakLabels;
   if (result.provenance) training.provenance = result.provenance;
   if (result.design) training.design = result.design;
+  if (result.calibration) training.calibration = result.calibration;
   return {
     version: options.version,
     created_at: options.createdAt ?? new Date().toISOString(),

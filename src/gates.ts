@@ -7,8 +7,8 @@ import type { HeadPolicy } from './threshold.ts';
 /** Below this many test examples, a gate without an explicit minimum warns that its estimate is thin. */
 const MIN_SUPPORT = 30;
 
-export function gateHead(policy: HeadPolicy, ev: HeadEvaluation, options: { maxEce?: number; calibrationAlpha?: number } = {}): { failures: string[]; warnings: string[] } {
-  const { maxEce = 0.05, calibrationAlpha } = options;
+export function gateHead(policy: HeadPolicy, ev: HeadEvaluation, options: { maxEce?: number; calibrationAlpha?: number; calibrationGate?: 'cox' | 'cox-corrected' | 'region'; calibrationTolerance?: number } = {}): { failures: string[]; warnings: string[] } {
+  const { maxEce = 0.05, calibrationAlpha, calibrationGate = 'cox-corrected' } = options;
   const failures: string[] = [];
   const warnings: string[] = [];
   if (ev.threshold > 1) {
@@ -66,11 +66,27 @@ export function gateHead(policy: HeadPolicy, ev: HeadEvaluation, options: { maxE
   else if (ev.calibration_rows !== undefined && ev.calibration_rows < MIN_CALIBRATION_ROWS) {
     if (!(ev.ece_prevalence_weighted <= maxEce)) warnings.push(`ECE ${ev.ece_prevalence_weighted.toFixed(3)} > ${maxEce} on only ${ev.calibration_rows} test rows left to the head (fewer than ${MIN_CALIBRATION_ROWS}: too few to judge calibration)`);
   } else if (!(ev.ece_prevalence_weighted <= maxEce)) failures.push(`ECE ${ev.ece_prevalence_weighted.toFixed(3)} > ${maxEce}`);
-  if (calibrationAlpha !== undefined && ev.calibration_test && ev.calibration_test.stable === false) {
-    warnings.push(`calibration test not applied: the recalibration fit is unstable (intercept ${ev.calibration_test.intercept.toFixed(1)}, slope ${ev.calibration_test.slope.toFixed(1)}) - the scores separate the classes almost perfectly`);
-  } else if (calibrationAlpha !== undefined && ev.calibration_test && ev.calibration_test.p_value <= calibrationAlpha) {
-    const c = ev.calibration_test;
-    failures.push(`probabilities are miscalibrated (Cox test p = ${c.p_value.toExponential(2)} <= ${calibrationAlpha}: intercept ${c.intercept.toFixed(3)}, slope ${c.slope.toFixed(3)}; calibrated is 0 and 1)`);
+  // Cox with its level corrected for the calibrator's error (stage CK, the default) needs a Platt calibrator,
+  // which evaluateHead was given; without one (isotonic, or evaluateHead called without it) plain Cox applies.
+  const cox = ev.calibration_test;
+  const corrected = calibrationGate === 'cox-corrected' ? cox?.corrected : undefined;
+  if (calibrationAlpha !== undefined && calibrationGate === 'cox-corrected' && cox && !corrected) {
+    warnings.push("calibration test level not corrected for the calibrator's error: that needs a Platt calibrator (isotonic has no fit covariance), so plain Cox applies");
+  }
+  if (calibrationAlpha !== undefined && calibrationGate === 'region') {
+    // The decision-region gate (stage CG): evaluateHead ran it at the training call's tolerance and level.
+    const r = ev.calibration_region;
+    const describe = () => r!.regions.map((x) => `${x.region} ${(100 * x.observed).toFixed(1)}% observed vs ${(100 * x.expected).toFixed(1)}% predicted (±${(100 * x.se).toFixed(1)})`).join('; ');
+    if (!r) warnings.push('calibration not checked: no rows at the decisions were left to the head');
+    else if (r.verdict === 'fail') failures.push(`probabilities are miscalibrated where decisions are made, by more than ${r.tolerance}: ${describe()}`);
+    else if (r.verdict === 'warn') warnings.push(`calibration within ${r.tolerance} at the decisions can't be confirmed on this test sample: ${describe()}`);
+  } else if (calibrationAlpha !== undefined && cox && corrected) {
+    if (!corrected.applied) warnings.push(`corrected calibration test not applied: a Platt fit's covariance is singular (the scores separate the classes almost perfectly)`);
+    else if (corrected.p_value <= calibrationAlpha) failures.push(`probabilities are miscalibrated (Cox test, corrected for the calibrator's error: p = ${corrected.p_value.toExponential(2)} <= ${calibrationAlpha}; intercept ${cox.intercept.toFixed(3)}, slope ${cox.slope.toFixed(3)}, calibrated is 0 and 1) - a check of the logistic recalibration against the calibration sample, blind to the curve's shape`);
+  } else if (calibrationAlpha !== undefined && cox && cox.stable === false) {
+    warnings.push(`calibration test not applied: the recalibration fit is unstable (intercept ${cox.intercept.toFixed(1)}, slope ${cox.slope.toFixed(1)}) - the scores separate the classes almost perfectly`);
+  } else if (calibrationAlpha !== undefined && cox && cox.p_value <= calibrationAlpha) {
+    failures.push(`probabilities are miscalibrated (Cox test p = ${cox.p_value.toExponential(2)} <= ${calibrationAlpha}: intercept ${cox.intercept.toFixed(3)}, slope ${cox.slope.toFixed(3)}; calibrated is 0 and 1) - a check of the logistic recalibration, blind to the curve's shape`);
   }
   return { failures, warnings };
 }

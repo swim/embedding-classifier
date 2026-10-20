@@ -181,7 +181,12 @@ export interface TrainInput<H extends string> {
         labels: ReadonlyArray<string | null>;
         C?: number;
     };
-    calibration?: 'platt' | 'isotonic';
+    /**
+     * The calibrator: Platt with Firth's bias reduction ('platt-firth', the default since stage CG: finite
+     * when the calibration scores separate the classes, where plain Platt's slope runs off; stored and
+     * served as Platt), plain Platt ('platt', the default before), or isotonic.
+     */
+    calibration?: 'platt' | 'platt-firth' | 'isotonic';
     /** review_floor = threshold × reviewRatio (default 0.5). */
     reviewRatio?: number;
     /**
@@ -194,9 +199,35 @@ export interface TrainInput<H extends string> {
     /**
      * Fail a head whose test-split probabilities Cox's recalibration test rejects at this level (default
      * off). Prefer it to maxEce for rare classes: in simulation the ECE > 0.05 gate never fired at 2%
-     * prevalence, even for badly miscalibrated probabilities.
+     * prevalence, even for badly miscalibrated probabilities. What it checks is narrow: whether the test
+     * split's logistic recalibration matches the calibrator. It cannot see the curve's shape, so
+     * probabilities that are wrong in the tail pass it as often as right ones.
      */
     calibrationAlpha?: number;
+    /**
+     * Which calibration gate calibrationAlpha applies: 'cox-corrected' (default since stage CK), Cox's
+     * recalibration test with the Platt calibrator's own sampling error counted (for isotonic calibration,
+     * plain Cox with a warning; not applied, with a warning, when a fit's covariance is singular); 'cox',
+     * the plain test, which treats the fitted calibrator as exact and so refuses about 10% of correctly
+     * calibrated heads at α = 0.01 - but also catches more heads whose calibrator is badly off by its own
+     * sampling error, which the corrected test forgives as noise; or 'region' (stage
+     * CG), the decision-region gate: fail when the observed rate and the mean probability differ by
+     * demonstrably more than calibrationTolerance (default 0.05) at or above the review floor or in the top
+     * decile of scores, counting the Platt calibrator's own sampling error.
+     */
+    calibrationGate?: 'cox' | 'cox-corrected' | 'region';
+    calibrationTolerance?: number;
+    /**
+     * 'pooled' (opt-in; default 'none'): after the gates, refit each head's Platt calibrator on the calibration
+     * and test splits together (each weighted as it was evaluated: 1/π with sampled records), and carry the
+     * threshold over by rank, so every decision is unchanged and only the probabilities move. The gates, the
+     * test evaluation and every threshold are still computed with the calibration-only fit; the shipped
+     * probabilities therefore have no held-out check of their own (a warning says so). Lab stage CP2: on 140
+     * heads the pooled probabilities were closer to the truth in the decision regions (−0.80 points; heads 5
+     * points or more off fell from 23 to 8; in simulation the chance of a large error roughly halved), with the
+     * best-calibrated head (ToxicChat jailbreak) slightly worse. Platt calibrators only.
+     */
+    calibrationRefit?: 'none' | 'pooled';
     groups?: readonly string[];
     slices?: Readonly<Record<string, readonly string[]>>;
     /**
@@ -314,6 +345,26 @@ export interface TrainResult<H extends string> {
             evaluation: 'design-linearised';
         }>;
     };
+    /** How the heads were calibrated and gated - store as artifact.training.calibration (buildArtifact does). */
+    calibration: CalibrationRecord;
+}
+/**
+ * The calibration choices a training run made, defaults resolved: the calibrator, and the calibration gates
+ * applied (the ECE bound; the calibration test when calibrationAlpha was given). A head's own
+ * `calibration.method` says only how it is served ('platt' covers both Platt fits), so a release records
+ * the fit here, to show whether a stored result is comparable with a later library's defaults.
+ */
+export interface CalibrationRecord {
+    method: 'platt' | 'platt-firth' | 'isotonic';
+    max_ece: number;
+    /** The calibration test, or null when calibrationAlpha was not given. */
+    gate: {
+        kind: 'cox' | 'cox-corrected' | 'region';
+        alpha: number;
+        tolerance?: number;
+    } | null;
+    /** Present when calibrationRefit 'pooled' was chosen: the shipped calibrators were refitted on calibration ∪ test after the gates. */
+    refit?: 'pooled';
 }
 export interface HeadChoice {
     chosen: HeadType;

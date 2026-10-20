@@ -43,7 +43,8 @@ export function reportMarkdown(artifact: ClassifierArtifact, options: { title?: 
       `| false-alarm rate | ${f3(ev.false_alarm_rate)} |`,
       `| precision (prevalence-weighted) | ${f3(ev.precision_prevalence_weighted)} |`,
       `| ECE (prevalence-weighted) | ${f4(ev.ece_prevalence_weighted)} |`,
-      ...(ev.calibration_test ? [`| calibration test (Cox): intercept / slope, p | ${ev.calibration_test.stable === false ? 'unstable (near-separation)' : `${f3(ev.calibration_test.intercept)} / ${f3(ev.calibration_test.slope)}, p = ${typeof ev.calibration_test.p_value === 'number' ? ev.calibration_test.p_value.toExponential(2) : 'n/a'}`} |`] : []),
+      ...(ev.calibration_test ? [`| calibration test (Cox): intercept / slope, p | ${ev.calibration_test.stable === false ? 'unstable (near-separation)' : `${f3(ev.calibration_test.intercept)} / ${f3(ev.calibration_test.slope)}, p = ${typeof ev.calibration_test.p_value === 'number' ? ev.calibration_test.p_value.toExponential(2) : 'n/a'}`}${ev.calibration_test.corrected ? `; corrected for the calibrator's error: ${ev.calibration_test.corrected.applied ? `p = ${ev.calibration_test.corrected.p_value.toExponential(2)}` : 'not applied (singular fit)'}` : ''} |`] : []),
+      ...(ev.calibration_region ? [`| calibration at the decisions: observed vs predicted (±se; the calibrator's share) | ${ev.calibration_region.regions.map((r) => `${r.region} ${f3(r.observed)} vs ${f3(r.expected)} (±${f3(r.se)}${r.se_calibrator !== undefined ? `; calibrator ±${f3(r.se_calibrator)}` : ''})`).join('; ')}: ${ev.calibration_region.verdict} at ±${ev.calibration_region.tolerance} |`] : []),
     );
     if (ev.vs_baseline) {
       lines.push(

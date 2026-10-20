@@ -4,7 +4,7 @@
  * is supplied, e.g. existing rules) what the classifier adds on top of it, and exact certified
  * bounds for the shipped threshold whatever chose it.
  */
-import { clopperPearsonLower, clopperPearsonUpper, coxTest, ece, kishEffectiveN, normalQuantile, stratifiedBootstrap, stratifiedRatio, weightedQuantile, wilson } from '@liquidau/solvers';
+import { clopperPearsonLower, clopperPearsonUpper, coxTest, coxTestCorrected, decisionRegionTest, ece, kishEffectiveN, normalQuantile, stratifiedBootstrap, stratifiedRatio, weightedQuantile, wilson } from '@liquidau/solvers';
 /** Exact one-sided bounds for a proportion `p` at a (Kish) effective sample size. */
 function exactAtEffective(p, nEff, confidence) {
     const n = Math.max(1, Math.round(nEff));
@@ -67,7 +67,7 @@ function designEvaluation(p, y, fired, design, slices, baseline) {
         } : {}),
     };
 }
-export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline, delta = 0.05, prevalence, design, scored }) {
+export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline, delta = 0.05, prevalence, design, scored, calibrationRegion, calibrator }) {
     if (!(delta > 0 && delta < 1))
         throw new Error(`delta must be strictly between 0 and 1, got ${delta}`);
     const lengths = [['y', y], ['w', w], ['groups', groups], ['baseline', baseline], ['scored', scored], ['design.inclusionProbs', design?.inclusionProbs], ['design.strata', design?.strata], ...Object.entries(slices).map(([f, v]) => [`slices.${f}`, v])];
@@ -165,6 +165,15 @@ export function evaluateHead({ p, y, w, threshold, groups, slices = {}, baseline
             maxNeg = Math.max(maxNeg, v); });
         const separated = minPos > maxNeg;
         result.calibration_test = { intercept: c.intercept, slope: c.slope, lr: c.lr, p_value: c.pValue, stable: converged && !separated && Math.abs(c.intercept) <= 10 && Math.abs(c.slope) <= 10 };
+        if (calibrator) {
+            const k = coxTestCorrected({ logits: keep(calibrator.logits), y: yc, w: wc, calibrator, covariance: calibrator.covariance, method: calibrator.method });
+            result.calibration_test.corrected = { wald: k.wald, p_value: k.pValue, applied: k.applied };
+        }
+    }
+    if (calibrationRegion && pc.length) {
+        const { floor, tolerance = 0.05, alpha = 0.01, logits, covariance } = calibrationRegion;
+        const r = decisionRegionTest({ p: pc, y: yc, w: wc, floor, tolerance, alpha, ...(logits ? { platt: { logits: keep(logits), covariance: covariance ?? null } } : {}) });
+        result.calibration_region = { verdict: r.verdict, tolerance, regions: r.regions };
     }
     if (design) {
         const d = designEvaluation(p, y, fired, design, slices, baseline);

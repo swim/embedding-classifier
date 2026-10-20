@@ -4,7 +4,7 @@
  * is supplied, e.g. existing rules) what the classifier adds on top of it, and exact certified
  * bounds for the shipped threshold whatever chose it.
  */
-import { type ReliabilityRow } from '@liquidau/solvers';
+import { type CalibrationRegion, type ReliabilityRow } from '@liquidau/solvers';
 import type { Guarantee, Sufficiency } from './conformal.ts';
 /**
  * Exact (Clopper-Pearson) bounds from the test split, which no threshold method sees - so they are
@@ -92,7 +92,8 @@ export interface HeadEvaluation {
     design?: DesignEvaluation;
     /**
      * Cox's recalibration test on the test split (weights as for ECE): y ~ a + b·logit(p), H0 a = 0, b = 1.
-     * Unlike ECE it has a stated error rate and stays sensitive for rare classes.
+     * Unlike ECE it has a stated error rate and stays sensitive for rare classes. It checks a logistic
+     * recalibration, not the curve's shape: probabilities wrong in the tail pass it as often as right ones.
      */
     calibration_test?: {
         intercept: number;
@@ -101,6 +102,22 @@ export interface HeadEvaluation {
         p_value: number;
         /** False under separation (every positive scores above every negative), or when the fit didn't converge or ran off (|a| or |b| > 10): the p-value then means nothing. */
         stable: boolean;
+        /**
+         * The same test with its level corrected for the Platt calibrator's own sampling error (stage CK,
+         * coxTestCorrected): a Wald test that the test split's Platt fit equals the calibrator, counting both
+         * fits' covariances. Absent for isotonic calibration; applied false when a covariance is singular.
+         */
+        corrected?: {
+            wald: number;
+            p_value: number;
+            applied: boolean;
+        };
+    };
+    /** The decision-region calibration check (stage CG): observed against predicted at or above the review floor and in the top decile. */
+    calibration_region?: {
+        verdict: 'pass' | 'warn' | 'fail';
+        tolerance: number;
+        regions: CalibrationRegion[];
     };
     /** Recall heads: what the shipped threshold guarantees from calibration, and why. */
     guarantee?: Guarantee;
@@ -142,5 +159,36 @@ export interface EvaluateInput {
      * precision still count every row.
      */
     scored?: readonly boolean[];
+    /**
+     * The decision-region calibration check: the review floor, its tolerance and level (defaults 0.05 and
+     * 0.01), and for a Platt calibrator the head's logits (aligned with p) and the fit's covariance
+     * (plattCovariance), so the calibrator's own error is counted.
+     */
+    calibrationRegion?: {
+        floor: number;
+        tolerance?: number;
+        alpha?: number;
+        logits?: readonly number[];
+        covariance?: {
+            aa: number;
+            ac: number;
+            cc: number;
+        } | null;
+    };
+    /**
+     * A Platt calibrator (its a and c, fitting method, covariance on the calibration rows) and the head's
+     * logits aligned with p: the Cox test is then also reported with its level corrected (calibration_test.corrected).
+     */
+    calibrator?: {
+        a: number;
+        c: number;
+        method: 'platt' | 'platt-firth';
+        logits: readonly number[];
+        covariance: {
+            aa: number;
+            ac: number;
+            cc: number;
+        } | null;
+    };
 }
-export declare function evaluateHead({ p, y, w, threshold, groups, slices, baseline, delta, prevalence, design, scored }: EvaluateInput): HeadEvaluation;
+export declare function evaluateHead({ p, y, w, threshold, groups, slices, baseline, delta, prevalence, design, scored, calibrationRegion, calibrator }: EvaluateInput): HeadEvaluation;

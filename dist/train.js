@@ -14,7 +14,7 @@
  * already reproduces production prevalence, so `prevalence` must not be passed), and the test
  * metrics become design-based estimates. The `design` threshold mode then applies.
  */
-import { clopperPearsonUpper, conformalLowerThreshold, conformalRank, decisionFunction, designPrecisionThreshold, designRiskThreshold, fitIsotonic, fitLogistic, fitPlatt, minimumSamples, nextUp, prevalenceWeights, sigmoid } from '@liquidau/solvers';
+import { clopperPearsonUpper, conformalLowerThreshold, conformalRank, decisionFunction, designPrecisionThreshold, designRiskThreshold, fitIsotonic, fitLogistic, fitPlatt, fitPlattFirth, minimumSamples, plattCovariance, nextUp, prevalenceWeights, sigmoid } from '@liquidau/solvers';
 import { designOf } from "./design.js";
 import { capTrainingWeights, validateProvenance } from "./records.js";
 import { conformalThreshold, groupScores, guaranteeChain } from "./conformal.js";
@@ -47,7 +47,7 @@ function indicesBySplit(split, y) {
     return idx;
 }
 export function trainHeads(input) {
-    const { X, split, C = 1, autoMargin = 0.2, requireConvergence = false, calibration: method = 'platt', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, groups, slices, background, records, seed = 0, log = () => { } } = input;
+    const { X, split, C = 1, autoMargin = 0.2, requireConvergence = false, calibration: method = 'platt-firth', reviewRatio = 0.5, reviewEpsilon, maxEce, calibrationAlpha, calibrationGate, calibrationTolerance, calibrationRefit = 'none', groups, slices, background, records, seed = 0, log = () => { } } = input;
     checkLength('split', split, X.length);
     split.forEach((s, i) => {
         if (!SPLITS.includes(s))
@@ -64,7 +64,15 @@ export function trainHeads(input) {
         throw new Error('autoMargin must be in [0, 1)');
     if (reviewEpsilon !== undefined && !(reviewEpsilon > 0 && reviewEpsilon < 1))
         throw new Error('reviewEpsilon must be strictly between 0 and 1');
-    const result = { heads: {}, evaluation: {}, failures: [], warnings: [], testProbabilities: {}, weakLabels: {}, headChoice: {}, convergence: {}, cascadeChoice: {} };
+    const gateKind = calibrationGate ?? 'cox-corrected';
+    if (calibrationRefit !== 'none' && calibrationRefit !== 'pooled')
+        throw new Error(`calibrationRefit must be 'none' or 'pooled', got ${String(calibrationRefit)}`);
+    if (calibrationRefit === 'pooled' && method === 'isotonic')
+        throw new Error("calibrationRefit 'pooled' refits a Platt calibrator; calibration 'isotonic' has none");
+    const result = {
+        heads: {}, evaluation: {}, failures: [], warnings: [], testProbabilities: {}, weakLabels: {}, headChoice: {}, convergence: {}, cascadeChoice: {},
+        calibration: { method, max_ece: maxEce ?? 0.05, gate: calibrationAlpha === undefined ? null : { kind: gateKind, alpha: calibrationAlpha, ...(gateKind === 'region' ? { tolerance: calibrationTolerance ?? 0.05 } : {}) }, ...(calibrationRefit === 'pooled' ? { refit: 'pooled' } : {}) },
+    };
     checkLength('foldKeys', input.foldKeys, X.length);
     const foldKey = (i) => input.foldKeys?.[i] ?? groups?.[i] ?? `#${i}`;
     // Provenance: validate every record, drop P5 near-duplicates from training, record overrides.
@@ -399,10 +407,12 @@ export function trainHeads(input) {
         }
         let calibrationConverged = true;
         let calibration;
-        if (method === 'platt') {
-            const { a, c, converged } = fitPlatt(keep(calLogits), keep(yCal), keep(wCal));
+        let calibrationCovariance = null;
+        if (method === 'platt' || method === 'platt-firth') {
+            const { a, c, converged } = (method === 'platt' ? fitPlatt : fitPlattFirth)(keep(calLogits), keep(yCal), keep(wCal));
             calibration = { method: 'platt', a, c };
             calibrationConverged = converged;
+            calibrationCovariance = plattCovariance(calibration, keep(calLogits), keep(wCal));
         }
         else
             calibration = { method: 'isotonic', ...fitIsotonic(keep(calLogits).map(sigmoid), keep(yCal), keep(wCal), { yMin: 0, yMax: 1 }) };
@@ -601,7 +611,8 @@ export function trainHeads(input) {
         }
         const reviewFloor = reviewEpsilon === undefined ? threshold * reviewRatio : Math.min(threshold, conformalLowerThreshold(positives, reviewEpsilon) ?? 0);
         const yTest = ySplit('test');
-        const pTest = idx.test.map((i) => preset(i) ?? calibrate(calibration, decisionFunction(model, rowFeatures(i))));
+        const zTest = idx.test.map((i) => (preset(i) === null ? decisionFunction(model, rowFeatures(i)) : 0));
+        const pTest = idx.test.map((i, j) => preset(i) ?? calibrate(calibration, zTest[j]));
         const atTest = (values) => idx.test.map((i) => values[i]);
         const testDesign = records ? designOf(idx.test.map((i) => records[i])) : null;
         const ev = evaluateHead({
@@ -616,6 +627,8 @@ export function trainHeads(input) {
             delta,
             prevalence,
             ...(dismissal || edge ? { scored: idx.test.map((i) => preset(i) === null) } : {}),
+            calibrationRegion: { floor: reviewFloor, tolerance: calibrationTolerance, alpha: calibrationAlpha, ...(calibration.method === 'platt' ? { logits: zTest, covariance: calibrationCovariance } : {}) },
+            ...(calibration.method === 'platt' && method !== 'isotonic' ? { calibrator: { a: calibration.a, c: calibration.c, method, logits: zTest, covariance: calibrationCovariance } } : {}),
         });
         if (guarantee)
             ev.guarantee = guarantee;
@@ -625,19 +638,45 @@ export function trainHeads(input) {
             ev.background_rate = backgroundP.filter((p) => p >= threshold).length / backgroundP.length;
             ev.background_rate_upper = backgroundUpper(backgroundP, threshold, backgroundRanks, 1 - delta / 2);
         }
-        const gates = gateHead(policy, ev, { maxEce, calibrationAlpha });
+        const gates = gateHead(policy, ev, { maxEce, calibrationAlpha, calibrationGate, calibrationTolerance });
         sink.evaluation[name] = ev;
         sink.failures.push(...gates.failures.map((f) => `${name}: ${f}`));
         sink.warnings.push(...gates.warnings.map((w) => `${name}: ${w}`));
+        // calibrationRefit 'pooled': everything above (thresholds, evaluation, gates) used the calibration-only
+        // fit. Refit on calibration ∪ test and carry each threshold over by rank, so decisions don't change.
+        let shipped = { calibration, threshold, reviewFloor, pTest };
+        if (calibrationRefit === 'pooled' && calibration.method === 'platt') {
+            const scoredTest = idx.test.map((i) => preset(i) === null);
+            const onTest = (v) => v.filter((_, j) => scoredTest[j]);
+            const wTest = testDesign ? testDesign.inclusionProbs.map((p) => 1 / p) : prevalenceWeights(yTest, prevalence);
+            const zs = [...keep(calLogits), ...onTest(zTest)];
+            const fit = (method === 'platt' ? fitPlatt : fitPlattFirth)(zs, [...keptY, ...onTest(yTest)], [...keep(wCal), ...onTest(wTest)]);
+            if (!(fit.a > 0)) {
+                sink.warnings.push(`${name}: calibrationRefit 'pooled': the pooled fit's slope ${fit.a} is not positive, so the calibration-only calibrator ships`);
+            }
+            else {
+                const pooled = { method: 'platt', a: fit.a, c: fit.c };
+                const carry = (t) => (t > 0 && t <= 1 ? calibrate(pooled, logitAt(calibration, t)) : t);
+                const t1 = carry(threshold);
+                const floor1 = reviewEpsilon === undefined ? t1 * reviewRatio : Math.min(t1, carry(reviewFloor));
+                // Decisions are unchanged by construction, up to rounding exactly at the threshold: count any.
+                let moved = 0;
+                for (const z of zs)
+                    if ((calibrate(calibration, z) >= threshold) !== (calibrate(pooled, z) >= t1))
+                        moved++;
+                shipped = { calibration: pooled, threshold: t1, reviewFloor: floor1, pTest: idx.test.map((i, j) => preset(i) ?? calibrate(pooled, zTest[j])) };
+                sink.warnings.push(`${name}: calibrationRefit 'pooled': the shipped calibrator was refitted on calibration ∪ test (${zs.length} rows) after the gates; the gates and the test evaluation used the calibration-only fit, so the shipped probabilities have no held-out check${fit.converged ? '' : ' (the pooled fit did not converge)'}${moved ? `; ${moved} labelled row(s) at the threshold changed side by rounding` : ''}`);
+            }
+        }
         sink.heads[name] = {
-            weights: model.coef, bias: model.intercept, ...(fitted?.features ? { features: fitted.features } : {}), calibration, threshold, review_floor: reviewFloor,
+            weights: model.coef, bias: model.intercept, ...(fitted?.features ? { features: fitted.features } : {}), calibration: shipped.calibration, threshold: shipped.threshold, review_floor: shipped.reviewFloor,
             ...(dismissal ? { dismissal: { rule_set: dismissal.ruleSet, max_rate: dismissal.maxRate, certified: dismissal.certified } } : {}),
             ...(edge ? { edge: { model_sha256: edge.edgeSha256 } } : {}),
             ...(middleSha256 ? { middle: { model_sha256: middleSha256 } } : {}),
             ...(guarantee ? { guarantee: chained(guarantee) } : {}), ...(reviewEpsilon !== undefined ? { review_epsilon: reviewEpsilon } : {}),
         };
         // Round-trip checks score embeddings, so rows decided before the head (never scored at runtime) are left out.
-        sink.testProbabilities[name] = { idx: idx.test.filter((i) => preset(i) === null), p: pTest.filter((_, j) => preset(idx.test[j]) === null) };
+        sink.testProbabilities[name] = { idx: idx.test.filter((i) => preset(i) === null), p: shipped.pTest.filter((_, j) => preset(idx.test[j]) === null) };
     };
     result.edgeChoice = {};
     for (const headIn of input.heads) {
@@ -699,6 +738,32 @@ export function trainHeads(input) {
     return result;
 }
 /**
+ * The smallest double z at which a Platt calibrator reaches t (0 < t ≤ 1, slope > 0): a threshold's place
+ * on the logit scale, found by bisection so that calibrate(calibration, z) >= t holds exactly from z up.
+ */
+function logitAt(calibration, t) {
+    const at = (z) => calibrate(calibration, z) >= t;
+    const guess = t < 1 ? (Math.log(t / (1 - t)) - calibration.c) / calibration.a : (40 - calibration.c) / calibration.a;
+    let step = 1, lo = guess - step, hi = guess + step;
+    while (at(lo)) {
+        step *= 2;
+        lo = guess - step;
+    }
+    while (!at(hi)) {
+        step *= 2;
+        hi = guess + step;
+    }
+    for (;;) {
+        const mid = lo + (hi - lo) / 2;
+        if (mid <= lo || mid >= hi)
+            return hi;
+        if (at(mid))
+            hi = mid;
+        else
+            lo = mid;
+    }
+}
+/**
  * Exact upper bound on the background firing rate at `threshold`. A threshold capped by the
  * background itself sits at or above the score just past a FIXED rank r, whose firing rate is a
  * uniform order statistic - so the bound for the largest rank any cap could have used is valid
@@ -750,6 +815,8 @@ export function buildArtifact(result, options) {
         training.provenance = result.provenance;
     if (result.design)
         training.design = result.design;
+    if (result.calibration)
+        training.calibration = result.calibration;
     return {
         version: options.version,
         created_at: options.createdAt ?? new Date().toISOString(),

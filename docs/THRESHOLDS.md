@@ -28,6 +28,11 @@ holds given those earlier thresholds, not jointly with them. The guarantee recor
 
 Read `1 − joint_delta` as the confidence of the whole pipeline. For a joint statement at a chosen level,
 certify each claim at that level divided by (claims + 1), or keep a calibration sample per tier.
+In testing (140 releases on a public Jira dataset) `joint_delta` was 0.15–0.20 in most releases and
+0.60 in 5, where the ladder tried all three edge candidates. A calibration sample per tier makes a
+single δ valid for the whole chain, but each tier then certifies on fewer positives: at about 65
+positives that is worth about one point of false alarms by the headroom table below (an estimate, not
+a measurement), less than the edge would lose.
 
 **The default is the strongest guarantee the data supports** (since 0.7): `design` with sampled
 calibration records, else `auto` without the silent heuristic fallback; a head the data can't
@@ -96,6 +101,55 @@ reviewer.
   observed against predicted, and how much of the ± is the calibrator's own (`se_calibrator`). When that
   share dominates, the calibration sample is what limits the probabilities. More calibration labels help;
   more test labels don't. See DATA.md for the calibration share.
+
+## Choosing a head's target and budget
+
+**Two limits on one threshold.** A recall head's threshold must be low enough that the certified
+recall bound reaches the target. With a background budget it must also be high enough to fire on at
+most the budget's share of ordinary traffic. When the first limit sits below the second, no threshold
+meets both, and the head fails its gates with the reason ("recall ≥ … needs a threshold ≤ a but
+background ≤ … needs ≥ b"). The fire rate is about prevalence × recall + (1 − prevalence) × false-alarm
+rate, so prevalence sets a floor: at 10% prevalence and recall 0.85, a head with 30% false alarms fires
+on about 36% of traffic.
+
+**Check a task before freezing it.** One release says only whether the head issued this time, and near
+the boundary that flips between samples. Before committing to a target and budget, train on a held-out
+slice of labelled history (a design replica) for the task and its stricter neighbours (the target one
+step up, the budget one step down), on several seeds. A task issued on most seeds whose stricter
+neighbours also mostly issue is comfortably feasible. In testing this predicted issuance on another
+sample of three datasets, and promises kept six months later on Jira, including on a period held back
+until the task was fixed (both later periods drifted benignly). A "no" is less reliable
+than a "yes": rejected tasks still issued on some seeds (in one later period those ran at or over their
+budget; in the other they didn't). The procedure is in liquidau-examples' README.
+
+**Headroom: what certifying costs.** The certificate is a lower confidence bound, so the threshold must
+reach the target with room to spare, and the room shrinks only as calibration positives grow. The
+smallest observed recall that certifies each target at δ = 0.05 (one-sided Clopper–Pearson with equal
+weights; design weights count Kish effective positives and need a little more):
+
+| Calibration positives | recall ≥ 0.70 | ≥ 0.75 | ≥ 0.80 | ≥ 0.85 | ≥ 0.90 |
+|---|---|---|---|---|---|
+| 30 | 0.867 | 0.900 | 0.933 | 0.967 | 1.000 |
+| 45 | 0.822 | 0.867 | 0.911 | 0.956 | 1.000 |
+| 65 | 0.800 | 0.846 | 0.892 | 0.938 | 0.969 |
+| 100 | 0.780 | 0.830 | 0.870 | 0.920 | 0.960 |
+| 150 | 0.767 | 0.813 | 0.860 | 0.900 | 0.947 |
+| 250 | 0.752 | 0.800 | 0.844 | 0.892 | 0.936 |
+| 500 | 0.736 | 0.784 | 0.832 | 0.878 | 0.924 |
+
+The room is paid for in false alarms. In testing, a Jira head promising recall ≥ 0.75 on about 65
+effective positives finished at 0.83–0.87 on later data, and the room cost 7–10 points of false
+alarms, about a quarter of them; the rest came from how separable the label is.
+Half as many again calibration labels cut that cost only from 6.6 to 5.9 points. The certified bounds
+held throughout: later recall fell below the test split's certified lower bound in none of 100
+releases.
+
+**A better model: take it as a stronger promise.** When better features improve the ranking, keeping
+the same target lets the threshold settle closer to it and spends the room above. In testing, Jira with
+the project and issue type as context broke 2 of 20 promises at recall ≥ 0.75. Raising the target
+keeps the room, and the better ranking still pays for it: the same flow at recall ≥ 0.80 had fewer
+false alarms than the baseline at 0.75 (25.2% against 28.2%) and kept 19 of 20 on a later period held
+back until the comparison was fixed.
 
 ## Gates and checks
 

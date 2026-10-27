@@ -225,7 +225,9 @@ export interface TrainInput<H extends string> {
      * probabilities therefore have no held-out check of their own (a warning says so). Lab stage CP2: on 140
      * heads the pooled probabilities were closer to the truth in the decision regions (−0.80 points; heads 5
      * points or more off fell from 23 to 8; in simulation the chance of a large error roughly halved), with the
-     * best-calibrated head (ToxicChat jailbreak) slightly worse. Platt calibrators only.
+     * best-calibrated head (ToxicChat jailbreak) slightly worse. Lab stage FX checked it on the frame rows outside
+     * the labelled sample (90 cases, fresh seeds): −0.62 points, cases 5 points or more off 22 → 17. A run still
+     * has no held-out check of its own. Platt calibrators only.
      */
     calibrationRefit?: 'none' | 'pooled';
     groups?: readonly string[];
